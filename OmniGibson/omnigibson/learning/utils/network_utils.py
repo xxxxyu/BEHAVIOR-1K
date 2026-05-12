@@ -26,6 +26,16 @@ logger.setLevel(logging.INFO)
 __all__ = ["WebsocketClientPolicy", "WebsocketPolicyServer"]
 
 
+def _normalize_for_logging(value):
+    if isinstance(value, dict):
+        return {k: _normalize_for_logging(v) for k, v in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.item() if value.shape == () else value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 class WebsocketClientPolicy:
     """Implements the Policy interface by communicating with a server over websocket.
 
@@ -46,6 +56,7 @@ class WebsocketClientPolicy:
         self._api_key = api_key
         self._ws, self._server_metadata = None, None
         self._allow_reconnect = allow_reconnect
+        self.last_response_metadata = None
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
@@ -111,6 +122,7 @@ class WebsocketClientPolicy:
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
         action_dict = unpackb(response)
+        self.last_response_metadata = action_dict.get("inference_metadata")
         try:
             action_np = deepcopy(action_dict["action"])
         except KeyError:
@@ -119,6 +131,7 @@ class WebsocketClientPolicy:
             self._ws.send(data)
             response = self._ws.recv()
             action_dict = unpackb(response)
+            self.last_response_metadata = action_dict.get("inference_metadata")
             action_np = deepcopy(action_dict["action"])
         action = th.from_numpy(action_np).to(th.float32)
         return action
@@ -127,6 +140,7 @@ class WebsocketClientPolicy:
         if self._ws is None:
             self._ws, self._server_metadata = self._wait_for_server()
 
+        self.last_response_metadata = None
         data = self._packer.pack({"reset": True})
         self._ws.send(data)
 
@@ -180,6 +194,8 @@ class WebsocketPolicyServer:
                     continue
 
                 obs = deepcopy(result)
+                if "task_progress" in obs:
+                    logger.info("Received task_progress from client: %s", _normalize_for_logging(obs["task_progress"]))
 
                 infer_time = time.monotonic()
                 action = self._policy.act(obs)
@@ -188,6 +204,9 @@ class WebsocketPolicyServer:
                 action = {
                     "action": action.cpu().numpy(),
                 }
+                inference_metadata = getattr(self._policy, "last_inference_metadata", None)
+                if inference_metadata is not None:
+                    action["inference_metadata"] = inference_metadata
                 action["server_timing"] = {
                     "infer_ms": infer_time * 1000,
                 }

@@ -235,7 +235,7 @@ fi
 if [ "$BDDL" = true ]; then
     echo "Installing BDDL..."
     [ ! -d "bddl3" ] && { echo "ERROR: bddl directory not found"; exit 1; }
-    pip install -e "$WORKDIR/bddl3"
+    pip install -e "$WORKDIR/bddl3" --config-settings editable_mode=compat
 fi
 
 # Install OmniGibson with Isaac Sim
@@ -302,6 +302,9 @@ if [ "$OMNIGIBSON" = true ]; then
         
         install_isaac_packages() {
             local temp_dir=$(mktemp -d)
+            local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/behavior-1k/isaacsim-wheels"
+            mkdir -p "$cache_dir"
+
             local packages=(
                 "omniverse_kit-106.5.0.162521" "isaacsim_kernel-4.5.0.0" "isaacsim_app-4.5.0.0"
                 "isaacsim_core-4.5.0.0" "isaacsim_gui-4.5.0.0" "isaacsim_utils-4.5.0.0"
@@ -319,22 +322,27 @@ if [ "$OMNIGIBSON" = true ]; then
                 local pkg_name=${pkg%-*}
                 local filename="${pkg}-cp310-none-manylinux_2_34_x86_64.whl"
                 local url="https://pypi.nvidia.com/${pkg_name//_/-}/$filename"
-                local filepath="$temp_dir/$filename"
-                
-                echo "Downloading $pkg..."
-                if ! curl -sL "$url" -o "$filepath"; then
-                    echo "ERROR: Failed to download $pkg"
-                    rm -rf "$temp_dir"
-                    return 1
+                local cache_file="$cache_dir/$filename"
+
+                if [ ! -s "$cache_file" ]; then
+                    echo "Downloading $pkg..."
+                    if ! curl -sL "$url" -o "$cache_file.tmp"; then
+                        echo "ERROR: Failed to download $pkg"
+                        rm -rf "$cache_file.tmp" "$temp_dir"
+                        return 1
+                    fi
+                    mv "$cache_file.tmp" "$cache_file"
+                else
+                    echo "Using cached $pkg"
                 fi
-                
-                # Rename for older GLIBC
+
+                local install_filename="$filename"
                 if check_glibc_old; then
-                    local new_filepath="${filepath/manylinux_2_34/manylinux_2_31}"
-                    mv "$filepath" "$new_filepath"
-                    filepath="$new_filepath"
+                    install_filename="${filename/manylinux_2_34/manylinux_2_31}"
                 fi
-                
+
+                local filepath="$temp_dir/$install_filename"
+                cp "$cache_file" "$filepath"
                 wheel_files+=("$filepath")
             done
             
@@ -371,7 +379,7 @@ fi
 if [ "$JOYLO" = true ]; then
     echo "Installing JoyLo..."
     [ ! -d "joylo" ] && { echo "ERROR: joylo directory not found"; exit 1; }
-    pip install -e "$WORKDIR/joylo"
+    pip install -e "$WORKDIR/joylo" -c <(echo "numpy<2")
 fi
 
 # Install Eval
@@ -379,8 +387,10 @@ if [ "$EVAL" = true ]; then
     # get torch version via pip and install corresponding torch-cluster
     TORCH_VERSION=$(pip show torch | grep Version | cut -d " " -f 2)
     pip install torch-cluster -f https://data.pyg.org/whl/torch-${TORCH_VERSION}.html
-    # install av and ffmpeg
-    conda install av "numpy<2" -c conda-forge -y
+    # Install PyAV from PyPI. Avoid conda-forge ffmpeg / libvulkan-loader here:
+    # Isaac Sim relies on the system Vulkan loader, and conda's loader can
+    # be picked up first from CONDA_PREFIX/lib and crash RTX initialization.
+    pip install "av>=12,<17" "numpy<2"
 fi
     
 # Install asset pipeline

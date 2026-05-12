@@ -53,6 +53,7 @@ class WebsocketPolicy:
     ) -> None:
         logging.info(f"Creating websocket client policy with host: {host}, port: {port}")
         self.last_action = None
+        self.last_inference_metadata = None
         self.policy = None
         if host is not None or port is not None:
             self.policy = WebsocketClientPolicy(host=host, port=port)
@@ -66,9 +67,11 @@ class WebsocketPolicy:
         # convert observation to numpy
         obs = torch_to_numpy(obs)
         self.last_action = self.policy.act(obs).detach().cpu()
+        self.last_inference_metadata = getattr(self.policy, "last_response_metadata", None)
         return self.last_action
 
     def reset(self) -> None:
         if self.policy is not None:
             self.policy.reset()
         self.last_action = None
+        self.last_inference_metadata = None
