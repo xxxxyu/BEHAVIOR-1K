@@ -131,6 +131,9 @@ class Evaluator:
         self.latest_task_progress = None
         self._last_logged_task_progress = None
         self.latest_inference_metadata = None
+        self._latest_logged_inference_metadata = None
+        self._inference_log_offset = 0
+        self._inference_log_fallback_logged = False
         self._debug_video_shape_logged = False
 
         self.env = self.load_env(env_wrapper=self.cfg.env_wrapper)
@@ -266,7 +269,7 @@ class Evaluator:
             6. Returns the termination and truncation status.
         """
         self.robot_action = self.policy.forward(obs=self.obs)
-        self.latest_inference_metadata = getattr(self.policy, "last_inference_metadata", None)
+        self.latest_inference_metadata = self._read_policy_inference_metadata()
 
         obs, _, terminated, truncated, info = self.env.step(self.robot_action, n_render_iterations=1)
         self._update_task_progress(info.get("task_progress"), source=f"step {self.env._current_step}")
@@ -403,6 +406,71 @@ class Evaluator:
             obs["task_progress"] = dict(self.latest_task_progress)
         return obs
 
+    def _read_policy_inference_metadata(self) -> dict | None:
+        metadata = getattr(self.policy, "last_inference_metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+
+        # Keep this fallback explicit: WebsocketPolicy wraps WebsocketClientPolicy,
+        # which stores the raw response metadata separately.
+        inner_policy = getattr(self.policy, "policy", None)
+        metadata = getattr(inner_policy, "last_response_metadata", None)
+        return metadata if isinstance(metadata, dict) else None
+
+    def _read_latest_inference_log_metadata(self) -> dict | None:
+        log_path = Path(self.cfg.log_path) / "inference_prompts.jsonl"
+        if not log_path.exists():
+            return self._latest_logged_inference_metadata
+
+        try:
+            if log_path.stat().st_size < self._inference_log_offset:
+                self._inference_log_offset = 0
+                self._latest_logged_inference_metadata = None
+
+            with log_path.open("r", encoding="utf-8") as f:
+                f.seek(self._inference_log_offset)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if record.get("event") != "infer":
+                        continue
+                    self._latest_logged_inference_metadata = {
+                        "inference_index": record.get("inference_index"),
+                        "mapped_subtask": record.get("mapped_subtask"),
+                        "prompt": record.get("prompt"),
+                        "task_progress": record.get("task_progress"),
+                    }
+                self._inference_log_offset = f.tell()
+        except OSError as exc:
+            logger.warning(f"Failed to read inference prompt log {log_path}: {exc}")
+
+        return self._latest_logged_inference_metadata
+
+    def _current_inference_metadata(self) -> dict:
+        policy_metadata = self.latest_inference_metadata if isinstance(self.latest_inference_metadata, dict) else {}
+        if policy_metadata.get("mapped_subtask") and policy_metadata.get("prompt"):
+            return policy_metadata
+
+        logged_metadata = self._read_latest_inference_log_metadata()
+        if not isinstance(logged_metadata, dict):
+            return policy_metadata
+
+        if not self._inference_log_fallback_logged:
+            logger.info("Using inference_prompts.jsonl as debug-video metadata fallback.")
+            self._inference_log_fallback_logged = True
+
+        metadata = dict(logged_metadata)
+        metadata.update({key: value for key, value in policy_metadata.items() if value is not None})
+        return metadata
+
     def _preprocess_obs(self, obs: dict) -> dict:
         """
         Preprocess the observation dictionary before passing it to the policy.
@@ -449,7 +517,7 @@ class Evaluator:
             right_wrist_rgb=right_wrist_raw,
             head_rgb=head_raw,
         )
-        metadata = self.latest_inference_metadata if isinstance(self.latest_inference_metadata, dict) else {}
+        metadata = self._current_inference_metadata()
         task_progress = metadata.get("task_progress") or self.latest_task_progress
         frame = build_debug_video_frame(
             left_wrist_rgb=left_wrist_rgb,
