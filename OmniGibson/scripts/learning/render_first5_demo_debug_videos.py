@@ -25,6 +25,53 @@ def _task_name_from_annotation(annotation_path: pathlib.Path) -> str:
     return str(task_name)
 
 
+def _write_index(output_root: pathlib.Path, records: list[dict]) -> None:
+    videos_by_task: dict[str, list[dict]] = {}
+    for record in records:
+        if record.get("status") != "ok":
+            continue
+        videos_by_task.setdefault(record["task_dir"], []).append(record)
+
+    lines = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        "<title>BEHAVIOR Demo Subtask Debug Videos</title>",
+        "<style>",
+        "body{font-family:Arial,sans-serif;margin:24px;background:#f7f7f7;color:#202124}",
+        "h1{font-size:24px} h2{font-size:18px;margin-top:28px}",
+        ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}",
+        ".card{background:white;border:1px solid #ddd;border-radius:6px;padding:10px}",
+        "video{width:100%;height:auto;background:#111}",
+        ".meta{font-size:13px;color:#555;margin:6px 0 8px}",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<h1>BEHAVIOR Demo Subtask Debug Videos</h1>",
+        f"<p>{len(records)} rendered records, grouped by task. Overlay shows demo annotation and mapped subtask.</p>",
+    ]
+    for task_dir in sorted(videos_by_task):
+        task_records = sorted(videos_by_task[task_dir], key=lambda item: item["episode"])
+        task_name = task_records[0].get("task_name", "unknown")
+        lines.append(f"<h2>{task_dir}: {task_name}</h2>")
+        lines.append('<div class="grid">')
+        for record in task_records:
+            video_path = pathlib.Path(record["output_path"])
+            rel_path = video_path.relative_to(output_root)
+            lines.extend(
+                [
+                    '<div class="card">',
+                    f'<div class="meta">{record["episode"]}</div>',
+                    f'<video controls preload="metadata" src="{rel_path.as_posix()}"></video>',
+                    "</div>",
+                ]
+            )
+        lines.append("</div>")
+    lines.extend(["</body>", "</html>"])
+    (output_root / "index.html").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render rollout-style debug videos for first N challenge demos/task.")
     parser.add_argument(
@@ -71,6 +118,7 @@ def main() -> None:
     successes = 0
     failures = 0
     skipped = 0
+    records: list[dict] = []
     started = time.time()
     with manifest_path.open("a", encoding="utf-8") as manifest_f, failures_path.open("a", encoding="utf-8") as failures_f:
         for job_index, (task_index, task_dir_name, annotation_path) in enumerate(jobs, start=1):
@@ -103,13 +151,15 @@ def main() -> None:
                     mapping_path=args.mapping_path.expanduser() if args.mapping_path is not None else None,
                 )
                 successes += 1
-                manifest_f.write(json.dumps({**record, "task_name": task_name, "status": "ok"}, sort_keys=True) + "\n")
+                ok_record = {**record, "task_name": task_name, "status": "ok"}
+                records.append(ok_record)
+                manifest_f.write(json.dumps(ok_record, sort_keys=True) + "\n")
                 manifest_f.flush()
             except Exception as exc:
                 failures += 1
-                failures_f.write(
-                    json.dumps({**record, "status": "failed", "error": repr(exc)}, sort_keys=True) + "\n"
-                )
+                failed_record = {**record, "status": "failed", "error": repr(exc)}
+                records.append(failed_record)
+                failures_f.write(json.dumps(failed_record, sort_keys=True) + "\n")
                 failures_f.flush()
                 print(f"[failed] {task_dir_name}/{episode_stem}: {exc}", flush=True)
 
@@ -121,6 +171,7 @@ def main() -> None:
                     flush=True,
                 )
 
+    _write_index(output_root, records)
     print(
         json.dumps(
             {
@@ -129,6 +180,7 @@ def main() -> None:
                 "failures": failures,
                 "skipped": skipped,
                 "output_root": str(output_root),
+                "index_path": str(output_root / "index.html"),
                 "manifest_path": str(manifest_path),
                 "failures_path": str(failures_path),
                 "elapsed_s": round(time.time() - started, 3),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pathlib
@@ -13,14 +14,21 @@ import numpy as np
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 OPENPI_BEHAVIOR_ROOT = pathlib.Path(os.environ.get("OPENPI_BEHAVIOR_ROOT", "/home/lixiangyu/repos/openpi-behavior"))
-sys.path.insert(0, str(REPO_ROOT / "OmniGibson"))
 sys.path.insert(0, str(OPENPI_BEHAVIOR_ROOT / "src"))
 
-from omnigibson.learning.utils.debug_video_utils import DEBUG_VIDEO_RESOLUTION  # noqa: E402
-from omnigibson.learning.utils.debug_video_utils import build_debug_video_frame  # noqa: E402
-from omnigibson.learning.utils.debug_video_utils import resize_debug_video_views  # noqa: E402
 from openpi.shared import behavior_subtask_mapping  # noqa: E402
 from openpi.shared import task_progress as task_progress_lib  # noqa: E402
+
+DEBUG_VIDEO_UTILS_PATH = REPO_ROOT / "OmniGibson" / "omnigibson" / "learning" / "utils" / "debug_video_utils.py"
+_debug_video_spec = importlib.util.spec_from_file_location("behavior_debug_video_utils", DEBUG_VIDEO_UTILS_PATH)
+if _debug_video_spec is None or _debug_video_spec.loader is None:
+    raise ImportError(f"Failed to load debug video utilities from {DEBUG_VIDEO_UTILS_PATH}")
+_debug_video_utils = importlib.util.module_from_spec(_debug_video_spec)
+_debug_video_spec.loader.exec_module(_debug_video_utils)
+
+DEBUG_VIDEO_RESOLUTION = _debug_video_utils.DEBUG_VIDEO_RESOLUTION
+build_debug_video_frame = _debug_video_utils.build_debug_video_frame
+resize_debug_video_views = _debug_video_utils.resize_debug_video_views
 
 
 CAMERA_DIRS = {
