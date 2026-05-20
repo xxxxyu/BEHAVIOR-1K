@@ -14,9 +14,63 @@ from omnigibson.object_states import (
     Filled,
     Cooked,
     Frozen,
+    IsGrasping,
 )
 
 ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
+PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
+
+
+def _object_open_fraction(obj):
+    open_state = obj.unwrapped.states[Open]
+    if open_state.relevant_joints_info is None:
+        return 1.0 if open_state.get_value() else 0.0
+    both_sides, relevant_joints, joint_directions = open_state.relevant_joints_info
+    if not relevant_joints:
+        return 0.0
+
+    sides = [1, -1] if both_sides else [1]
+    max_fraction = 0.0
+    for side in sides:
+        for joint, joint_direction in zip(relevant_joints, joint_directions):
+            direction = joint_direction * side
+            closed_end = joint.lower_limit if direction == 1 else joint.upper_limit
+            open_end = joint.upper_limit if direction == 1 else joint.lower_limit
+            denom = open_end - closed_end
+            if abs(denom) < 1e-6:
+                continue
+            fraction = (joint.get_state()[0] - closed_end) / denom
+            fraction = th.as_tensor(fraction).clamp(0.0, 1.0).item()
+            max_fraction = max(max_fraction, float(fraction))
+    return max_fraction
+
+
+def _check_state_spec(env, spec):
+    objs = env.task.object_scope
+    if len(spec) == 4 and isinstance(spec[3], bool):
+        obj = objs[spec[1]]
+        return obj.exists and obj.unwrapped.states[spec[2]].get_value() == spec[3]
+    if len(spec) == 5:
+        if spec[3] not in objs:
+            # Special case: e.g. category "tree.n.01" is not in object scope.
+            all_instances = [
+                inst for inst, category in env.task.object_instance_to_category.items() if category == spec[3]
+            ]
+            assert len(all_instances) > 0, f"Could not find any instances for category {spec[3]}"
+            obj1 = objs[spec[1]]
+            return any(
+                obj1.exists
+                and objs[inst].exists
+                and obj1.unwrapped.states[spec[2]].get_value(objs[inst].unwrapped) == spec[4]
+                for inst in all_instances
+            )
+        obj1, obj2 = objs[spec[1]], objs[spec[3]]
+        return (
+            obj1.exists
+            and obj2.exists
+            and obj1.unwrapped.states[spec[2]].get_value(obj2.unwrapped) == spec[4]
+        )
+    raise ValueError(f"Invalid state spec: {spec}")
 
 
 def check_progress(env, check_specs):
@@ -55,34 +109,28 @@ def check_progress(env, check_specs):
 
         elif check_type == "state":
             # Check if it's a relational or non-relational state based on argument pattern
-            if len(spec) == 4 and isinstance(spec[3], bool):
-                # ("state", obj_key, state_name, expected_bool) - non-relational state, e.g. ToggledOn, Open
-                obj = objs[spec[1]]
-                results[name] = obj.exists and obj.unwrapped.states[spec[2]].get_value() == spec[3]
-            elif len(spec) == 5:
-                # ("state", obj1_key, state_name, obj2_key, expected_bool) - relational state with explicit bool, e.g. Inside, OnTop
-                if spec[3] not in objs:
-                    # Special case: e.g. category "tree.n.01" is not in object scope
-                    all_instances = [
-                        inst for inst, category in env.task.object_instance_to_category.items() if category == spec[3]
-                    ]
-                    assert len(all_instances) > 0, f"Could not find any instances for category {spec[3]}"
-                    obj1 = objs[spec[1]]
-                    results[name] = any(
-                        obj1.exists
-                        and objs[inst].exists
-                        and obj1.unwrapped.states[spec[2]].get_value(objs[inst].unwrapped) == spec[4]
-                        for inst in all_instances
-                    )
-                else:
-                    obj1, obj2 = objs[spec[1]], objs[spec[3]]
-                    results[name] = (
-                        obj1.exists
-                        and obj2.exists
-                        and obj1.unwrapped.states[spec[2]].get_value(obj2.unwrapped) == spec[4]
-                    )
-            else:
-                raise ValueError(f"Invalid state spec: {spec}")
+            results[name] = _check_state_spec(env, spec)
+
+        elif check_type == "any_state":
+            # ("any_state", [state_spec, ...]) - useful for BDDL goals with OR branches.
+            results[name] = any(_check_state_spec(env, state_spec) for state_spec in spec[1])
+
+        elif check_type == "grasping":
+            # ("grasping", robot_key, obj_key, expected_bool) - robot is grasping object
+            robot, obj = objs[spec[1]], objs[spec[2]]
+            results[name] = (
+                robot.exists
+                and obj.exists
+                and robot.unwrapped.states[IsGrasping].get_value(obj.unwrapped) == spec[3]
+            )
+
+        elif check_type == "open_fraction":
+            # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
+            obj = objs[spec[1]]
+            results[name] = (
+                obj.exists
+                and (_object_open_fraction(obj) >= spec[2]) == spec[3]
+            )
 
         elif check_type == "exists":
             # ("exists", obj_key, expected_bool) - check if object exists
@@ -108,6 +156,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_trash_can": ("near", "agent.n.01_1", "ashcan.n.01_1"),
+            "trash_can_picked_up": ("grasping", "agent.n.01_1", "ashcan.n.01_1", True),
             "robot_near_can_of_soda_1": ("near", "agent.n.01_1", "can__of__soda.n.01_1"),
             "robot_near_can_of_soda_2": ("near", "agent.n.01_1", "can__of__soda.n.01_2"),
             "robot_near_can_of_soda_3": ("near", "agent.n.01_1", "can__of__soda.n.01_3"),
@@ -120,12 +169,14 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "can_of_soda_1_in_trash": ("state", "can__of__soda.n.01_1", Inside, "ashcan.n.01_1", True),
             "can_of_soda_2_in_trash": ("state", "can__of__soda.n.01_2", Inside, "ashcan.n.01_1", True),
             "can_of_soda_3_in_trash": ("state", "can__of__soda.n.01_3", Inside, "ashcan.n.01_1", True),
+            "trash_can_on_floor": ("state", "ashcan.n.01_1", OnTop, "floor.n.01", True),
         },
     ),
     "putting_away_Halloween_decorations": lambda env: check_progress(
         env,
         {
-            "cabinet_open": ("state", "cabinet.n.01_1", Open, True),
+            "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
+            "cabinet_open": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "robot_near_candle_1": ("near", "agent.n.01_1", "candle.n.01_1"),
             "robot_near_candle_2": ("near", "agent.n.01_1", "candle.n.01_2"),
             "robot_near_candle_3": ("near", "agent.n.01_1", "candle.n.01_3"),
@@ -152,7 +203,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_table": ("near", "agent.n.01_1", "breakfast_table.n.01_1"),
             "robot_near_sink": ("near", "agent.n.01_1", "sink.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "plate_1_picked_up": ("state", "plate.n.04_1", OnTop, "breakfast_table.n.01_1", False),
             "plate_2_picked_up": ("state", "plate.n.04_2", OnTop, "breakfast_table.n.01_1", False),
             "pizza_1_in_fridge": ("state", "pizza.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
@@ -171,11 +222,11 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_chopping_board": ("near", "agent.n.01_1", "chopping_board.n.01_1"),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "jar_1_picked_up": ("state", "hinged_jar.n.01_1", Inside, "cabinet.n.01_1", False),
             "jar_2_picked_up": ("state", "hinged_jar.n.01_2", Inside, "cabinet.n.01_1", False),
-            "jar_1_opened": ("state", "hinged_jar.n.01_1", Open, True),
-            "jar_2_opened": ("state", "hinged_jar.n.01_2", Open, True),
+            "jar_1_opened": ("open_fraction", "hinged_jar.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "jar_2_opened": ("open_fraction", "hinged_jar.n.01_2", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "bratwurst_1_picked_up": ("state", "bratwurst.n.01_1", OnTop, "chopping_board.n.01_1", False),
             "bratwurst_2_picked_up": ("state", "bratwurst.n.01_2", OnTop, "chopping_board.n.01_1", False),
             "bratwurst_3_picked_up": ("state", "bratwurst.n.01_3", OnTop, "chopping_board.n.01_1", False),
@@ -213,6 +264,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_basket": ("near", "agent.n.01_1", "wicker_basket.n.01_1"),
             "robot_near_tree": ("near", "agent.n.01_1", "tree.n.01_1"),
+            "basket_picked_up": ("state", "wicker_basket.n.01_1", OnTop, "lawn.n.01_1", False),
+            "basket_next_to_tree": ("state", "wicker_basket.n.01_1", NextTo, "tree.n.01", True),
             "egg_1_out_of_basket": ("state", "easter_egg.n.01_1", Inside, "wicker_basket.n.01_1", False),
             "egg_2_out_of_basket": ("state", "easter_egg.n.01_2", Inside, "wicker_basket.n.01_1", False),
             "egg_3_out_of_basket": ("state", "easter_egg.n.01_3", Inside, "wicker_basket.n.01_1", False),
@@ -249,7 +302,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "toaster_picked_up": ("state", "toaster.n.02_1", OnTop, "countertop.n.01_1", False),
             "food_processor_picked_up": ("state", "food_processor.n.01_1", OnTop, "countertop.n.01_1", False),
             "french_press_picked_up": ("state", "french_press.n.01_1", OnTop, "countertop.n.01_1", False),
@@ -266,6 +319,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_tree": ("near", "agent.n.01_1", "christmas_tree.n.05_1"),
             "robot_near_table": ("near", "agent.n.01_1", "table.n.02_1"),
             "robot_near_sofa": ("near", "agent.n.01_1", "sofa.n.01_1"),
+            "basket_picked_up": ("state", "wicker_basket.n.01_1", OnTop, "floor.n.01_1", False),
+            "basket_on_table": ("state", "wicker_basket.n.01_1", OnTop, "table.n.02_1", True),
             "wreath_out_of_basket": ("state", "wreath.n.01_1", Inside, "wicker_basket.n.01_1", False),
             "candy_cane_1_out_of_basket": ("state", "candy_cane.n.01_1", Inside, "wicker_basket.n.01_1", False),
             "candy_cane_2_out_of_basket": ("state", "candy_cane.n.01_2", Inside, "wicker_basket.n.01_1", False),
@@ -305,7 +360,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_countertop_1": ("near", "agent.n.01_1", "countertop.n.01_1"),
             "robot_near_countertop_2": ("near", "agent.n.01_1", "countertop.n.01_2"),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "plate_1_picked_up": ("state", "plate.n.04_1", OnTop, "countertop.n.01_1", False),
             "plate_2_picked_up": ("state", "plate.n.04_2", OnTop, "countertop.n.01_1", False),
             "plate_3_picked_up": ("state", "plate.n.04_3", OnTop, "countertop.n.01_1", False),
@@ -336,7 +391,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "apple_1_picked_up": ("state", "half__apple.n.01_1", OnTop, "chopping_board.n.01_1", False),
             "apple_2_picked_up": ("state", "half__apple.n.01_2", OnTop, "chopping_board.n.01_1", False),
             "cookie_picked_up": ("state", "chocolate_chip_cookie.n.01_1", OnTop, "chopping_board.n.01_1", False),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tea_picked_up": ("state", "bottle__of__tea.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
             "sandwich_in_box": ("state", "club_sandwich.n.01_1", Inside, "packing_box.n.02_1", True),
             "apple_1_in_box": ("state", "half__apple.n.01_1", Inside, "packing_box.n.02_1", True),
@@ -352,7 +407,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_car": ("near", "agent.n.01_1", "car.n.01_1"),
             "robot_near_table": ("near", "agent.n.01_1", "table.n.02_1"),
             "robot_near_container": ("near", "agent.n.01_1", "container.n.01_1"),
-            "car_opened": ("state", "car.n.01_1", Open, True),
+            "car_opened": ("open_fraction", "car.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "container_picked_up_floor_1": ("state", "container.n.01_1", OnTop, "floor.n.01_1", False),
             "container_picked_up_floor_2": ("state", "container.n.01_1", OnTop, "floor.n.01_2", False),
             "camera_picked_up": ("state", "digital_camera.n.01_1", OnTop, "table.n.02_1", False),
@@ -372,7 +427,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "car_closed": ("state", "car.n.01_1", Open, False),
             "tomato_out_of_bag": ("state", "beefsteak_tomato.n.01_1", Inside, "sack.n.01_1", False),
             "milk_out_of_bag": ("state", "carton__of__milk.n.01_1", Inside, "sack.n.01_1", False),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tomato_in_fridge": ("state", "beefsteak_tomato.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
             "milk_in_fridge": ("state", "carton__of__milk.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
@@ -402,6 +457,13 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "container_2_picked_up": ("state", "storage_container.n.01_2", OnTop, "floor.n.01_1", False),
             "container_1_in_garage": ("state", "storage_container.n.01_1", OnTop, "floor.n.01_2", True),
             "container_2_in_garage": ("state", "storage_container.n.01_2", OnTop, "floor.n.01_2", True),
+            "containers_stacked": (
+                "any_state",
+                [
+                    ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
+                    ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
+                ],
+            ),
             "container_1_stacked": ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
             "container_2_stacked": ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
         },
@@ -411,7 +473,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_coffee_table": ("near", "agent.n.01_1", "coffee_table.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "bottle_1_picked_up": ("state", "bottle.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
             "bottle_2_picked_up": ("state", "bottle.n.01_2", Inside, "electric_refrigerator.n.01_1", False),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
@@ -439,7 +501,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_toolbox": ("near", "agent.n.01_1", "toolbox.n.01_1"),
-            "toolbox_opened": ("state", "toolbox.n.01_1", Open, True),
+            "toolbox_opened": ("open_fraction", "toolbox.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "drill_picked_up": ("state", "drill.n.01_1", OnTop, "tabletop.n.01_1", False),
             "pliers_picked_up": ("state", "pliers.n.01_1", OnTop, "tabletop.n.01_1", False),
             "flashlight_picked_up": ("state", "flashlight.n.01_1", OnTop, "tabletop.n.01_1", False),
@@ -545,7 +607,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "chips_1_picked_up": ("state", "bag__of__chips.n.01_1", OnTop, "countertop.n.01_1", False),
             "chips_2_picked_up": ("state", "bag__of__chips.n.01_2", OnTop, "countertop.n.01_1", False),
             "oil_1_picked_up": ("state", "bottle__of__olive_oil.n.01_1", OnTop, "countertop.n.01_1", False),
@@ -554,14 +616,14 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "sugar_2_picked_up": ("state", "jar__of__sugar.n.01_2", OnTop, "countertop.n.01_1", False),
             "oatmeal_1_picked_up": ("state", "box__of__oatmeal.n.01_1", OnTop, "countertop.n.01_1", False),
             "oatmeal_2_picked_up": ("state", "box__of__oatmeal.n.01_2", OnTop, "countertop.n.01_1", False),
-            "chips_1_stored": ("state", "bag__of__chips.n.01_1", Inside, "cabinet.n.01_1", True),
-            "chips_2_stored": ("state", "bag__of__chips.n.01_2", Inside, "cabinet.n.01_1", True),
-            "oil_1_stored": ("state", "bottle__of__olive_oil.n.01_1", Inside, "cabinet.n.01_1", True),
-            "oil_2_stored": ("state", "bottle__of__olive_oil.n.01_2", Inside, "cabinet.n.01_1", True),
-            "sugar_1_stored": ("state", "jar__of__sugar.n.01_1", Inside, "cabinet.n.01_1", True),
-            "sugar_2_stored": ("state", "jar__of__sugar.n.01_2", Inside, "cabinet.n.01_1", True),
-            "oatmeal_1_stored": ("state", "box__of__oatmeal.n.01_1", Inside, "cabinet.n.01_1", True),
-            "oatmeal_2_stored": ("state", "box__of__oatmeal.n.01_2", Inside, "cabinet.n.01_1", True),
+            "chips_1_stored": ("state", "bag__of__chips.n.01_1", Inside, "cabinet.n.01", True),
+            "chips_2_stored": ("state", "bag__of__chips.n.01_2", Inside, "cabinet.n.01", True),
+            "oil_1_stored": ("state", "bottle__of__olive_oil.n.01_1", Inside, "cabinet.n.01", True),
+            "oil_2_stored": ("state", "bottle__of__olive_oil.n.01_2", Inside, "cabinet.n.01", True),
+            "sugar_1_stored": ("state", "jar__of__sugar.n.01_1", Inside, "cabinet.n.01", True),
+            "sugar_2_stored": ("state", "jar__of__sugar.n.01_2", Inside, "cabinet.n.01", True),
+            "oatmeal_1_stored": ("state", "box__of__oatmeal.n.01_1", Inside, "cabinet.n.01", True),
+            "oatmeal_2_stored": ("state", "box__of__oatmeal.n.01_2", Inside, "cabinet.n.01", True),
             "cabinet_closed": ("state", "cabinet.n.01_1", Open, False),
         },
     ),
@@ -577,7 +639,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "pie_picked_up": ("state", "half__apple_pie.n.01_1", OnTop, "plate.n.04_2", False),
             "chicken_in_tupperware": ("state", "half__chicken.n.01_1", Inside, "tupperware.n.01_1", True),
             "pie_in_tupperware": ("state", "half__apple_pie.n.01_1", Inside, "tupperware.n.01_2", True),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tupperware_1_in_fridge": ("state", "tupperware.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
             "tupperware_2_in_fridge": ("state", "tupperware.n.01_2", Inside, "electric_refrigerator.n.01_1", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
@@ -689,6 +751,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_table": ("near", "agent.n.01_1", "table.n.02_1"),
             "robot_near_fireplace": ("near", "agent.n.01_1", "wood_fireplace.n.01_1"),
+            "robot_near_firewood_1": ("near", "agent.n.01_1", "firewood.n.01_1"),
+            "robot_near_firewood_2": ("near", "agent.n.01_1", "firewood.n.01_2"),
             "newspaper_picked_up": ("state", "newspaper.n.03_1", OnTop, "table.n.02_1", False),
             "lighter_picked_up": ("state", "cigar_lighter.n.01_1", OnTop, "table.n.02_1", False),
             "firewood_1_picked_up": ("state", "firewood.n.01_1", OnTop, "floor.n.01_1", False),
@@ -710,7 +774,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_washer": ("near", "agent.n.01_1", "washer.n.03_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "washer_opened": ("state", "washer.n.03_1", Open, True),
+            "washer_opened": ("open_fraction", "washer.n.03_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "glove_1_picked_up": ("state", "boxing_glove.n.01_1", OnTop, "countertop.n.01_1", False),
             "glove_2_picked_up": ("state", "boxing_glove.n.01_2", OnTop, "countertop.n.01_1", False),
             "glove_1_in_washer": ("state", "boxing_glove.n.01_1", Inside, "washer.n.03_1", True),
@@ -726,7 +790,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_washer": ("near", "agent.n.01_1", "washer.n.03_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "washer_opened": ("state", "washer.n.03_1", Open, True),
+            "washer_opened": ("open_fraction", "washer.n.03_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "cap_1_picked_up": ("state", "baseball_cap.n.01_1", OnTop, "countertop.n.01_1", False),
             "cap_2_picked_up": ("state", "baseball_cap.n.01_2", OnTop, "countertop.n.01_1", False),
             "cap_1_in_washer": ("state", "baseball_cap.n.01_1", Inside, "washer.n.03_1", True),
@@ -742,8 +806,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_washer": ("near", "agent.n.01_1", "washer.n.03_1"),
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
-            "washer_opened": ("state", "washer.n.03_1", Open, True),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "washer_opened": ("open_fraction", "washer.n.03_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "teddy_1_picked_up": ("state", "teddy.n.01_1", Inside, "cabinet.n.01_1", False),
             "teddy_2_picked_up": ("state", "teddy.n.01_2", Inside, "cabinet.n.01_1", False),
             "tennis_ball_picked_up": ("state", "tennis_ball.n.01_1", Inside, "cabinet.n.01_1", False),
@@ -828,7 +892,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "microwave_opened": ("state", "microwave.n.02_1", Open, True),
+            "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "popcorn_bag_picked_up": ("state", "popcorn__bag.n.01_1", OnTop, "countertop.n.01_1", False),
             "popcorn_bag_in_microwave": ("state", "popcorn__bag.n.01_1", Inside, "microwave.n.02_1", True),
             "microwave_closed": ("state", "microwave.n.02_1", Open, False),
@@ -842,7 +906,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
             "robot_near_stove": ("near", "agent.n.01_1", "stove.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "cabbage_picked_up": ("state", "head_cabbage.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
             "chili_picked_up": ("state", "chili.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
@@ -877,7 +941,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "pepper_1_retrieved": ("state", "bell_pepper.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
             "pepper_2_retrieved": ("state", "bell_pepper.n.02_2", Inside, "electric_refrigerator.n.01_1", False),
             "beet_1_retrieved": ("state", "beet.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
@@ -886,6 +950,9 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
             "veggies_on_board_1": ("state", "bell_pepper.n.02_1", OnTop, "chopping_board.n.01", True),
             "veggies_on_board_2": ("state", "bell_pepper.n.02_2", OnTop, "chopping_board.n.01", True),
+            "beet_1_on_board": ("state", "beet.n.02_1", OnTop, "chopping_board.n.01", True),
+            "beet_2_on_board": ("state", "beet.n.02_2", OnTop, "chopping_board.n.01", True),
+            "zucchini_on_board": ("state", "zucchini.n.02_1", OnTop, "chopping_board.n.01", True),
             "parer_picked_up": ("state", "parer.n.02_1", OnTop, "countertop.n.01_1", False),
             "peppers_diced": ("exists", "diced__bell_pepper.n.01_1", True),
             "beets_diced": ("exists", "diced__beet.n.01_1", True),
@@ -898,6 +965,10 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_driveway": ("near", "agent.n.01_1", "driveway.n.01_1"),
             "robot_near_chopping_block": ("near", "agent.n.01_1", "chopping_block.n.01_1"),
             "axe_picked_up": ("state", "ax.n.01_1", OnTop, "driveway.n.01_1", False),
+            "log_1_picked_up": ("state", "log.n.01_1", OnTop, "driveway.n.01_1", False),
+            "log_2_picked_up": ("state", "log.n.01_2", OnTop, "driveway.n.01_1", False),
+            "log_3_picked_up": ("state", "log.n.01_3", OnTop, "driveway.n.01_1", False),
+            "log_4_picked_up": ("state", "log.n.01_4", OnTop, "driveway.n.01_1", False),
             "log_1_on_block": ("state", "log.n.01_1", OnTop, "chopping_block.n.01_1", True),
             "log_1_chopped": ("exists", "half__log.n.01_1", True),
             "log_1_chopped_2": ("exists", "half__log.n.01_2", True),
@@ -917,11 +988,11 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "hotdog_1_retrieved": ("state", "hotdog.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
             "hotdog_2_retrieved": ("state", "hotdog.n.02_2", Inside, "electric_refrigerator.n.01_1", False),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
-            "microwave_opened": ("state", "microwave.n.02_1", Open, True),
+            "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "hotdog_1_in_microwave": ("state", "hotdog.n.02_1", Inside, "microwave.n.02_1", True),
             "hotdog_2_in_microwave": ("state", "hotdog.n.02_2", Inside, "microwave.n.02_1", True),
             "microwave_closed": ("state", "microwave.n.02_1", Open, False),
@@ -935,7 +1006,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_stove": ("near", "agent.n.01_1", "stove.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tray_retrieved": ("state", "tray.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
             "bacon_in_pan": ("state", "bacon.n.01_1", Inside, "frying_pan.n.01_1", True),
@@ -955,14 +1026,14 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tupperware_1_retrieved": ("state", "tupperware.n.01_1", Inside, "cabinet.n.01_1", False),
             "tupperware_2_retrieved": ("state", "tupperware.n.01_2", Inside, "cabinet.n.01_1", False),
             "pie_1_picked_up": ("state", "apple_pie.n.01_1", OnTop, "plate.n.04_1", False),
             "pie_2_picked_up": ("state", "apple_pie.n.01_2", OnTop, "plate.n.04_2", False),
             "pie_1_in_tupperware": ("state", "apple_pie.n.01_1", Inside, "tupperware.n.01_1", True),
             "pie_2_in_tupperware": ("state", "apple_pie.n.01_2", Inside, "tupperware.n.01_2", True),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tupperware_1_in_fridge": ("state", "tupperware.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
             "tupperware_2_in_fridge": ("state", "tupperware.n.01_2", Inside, "electric_refrigerator.n.01_1", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
@@ -976,12 +1047,13 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "steak_retrieved": ("state", "steak.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
             "pineapple_retrieved": ("state", "pineapple.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
-            "cabinet_opened": ("state", "cabinet.n.01_1", Open, True),
+            "cabinet_opened": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "bowls_retrieved": ("state", "bowl.n.01_1", Inside, "cabinet.n.01_1", False),
+            "bowl_2_retrieved": ("state", "bowl.n.01_2", Inside, "cabinet.n.01_1", False),
             "steak_on_board": ("state", "steak.n.01_1", OnTop, "chopping_board.n.01_1", True),
             "pineapple_on_board": ("state", "pineapple.n.02_1", OnTop, "chopping_board.n.01_1", True),
             "steak_diced": ("exists", "diced__steak.n.01_1", True),
@@ -989,6 +1061,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "steak_in_bowl": ("state", "bowl.n.01_1", Filled, "diced__steak.n.01_1", True),
             "pineapple_in_bowl": ("state", "bowl.n.01_2", Filled, "diced__pineapple.n.01_1", True),
             "bowls_in_cabinet": ("state", "bowl.n.01_1", Inside, "cabinet.n.01_1", True),
+            "bowl_2_in_cabinet": ("state", "bowl.n.01_2", Inside, "cabinet.n.01_1", True),
             "cabinet_closed": ("state", "cabinet.n.01_1", Open, False),
         },
     ),
@@ -999,7 +1072,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_oven": ("near", "agent.n.01_1", "oven.n.01_1"),
             "onion_chopped": ("exists", "vidalia_onion.n.01_1", False),
-            "fridge_opened": ("state", "electric_refrigerator.n.01_1", Open, True),
+            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "tupperware_1_retrieved": ("state", "tupperware.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
             "tupperware_2_retrieved": ("state", "tupperware.n.01_2", Inside, "electric_refrigerator.n.01_1", False),
             "tupperware_3_retrieved": ("state", "tupperware.n.01_3", Inside, "electric_refrigerator.n.01_1", False),
@@ -1014,7 +1087,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "pepperoni_3_on_dough": ("state", "pepperoni.n.01_3", OnTop, "pizza_dough.n.01_1", True),
             "pepperoni_4_on_dough": ("state", "pepperoni.n.01_4", OnTop, "pizza_dough.n.01_1", True),
             "cheese_on_pizza": ("state", "pizza_dough.n.01_1", Covered, "grated_cheese.n.01_1", True),
-            "oven_opened": ("state", "oven.n.01_1", Open, True),
+            "oven_opened": ("open_fraction", "oven.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "sheet_in_oven": ("state", "cookie_sheet.n.01_1", Inside, "oven.n.01_1", True),
             "oven_closed": ("state", "oven.n.01_1", Open, False),
             "oven_on": ("state", "oven.n.01_1", ToggledOn, True),
