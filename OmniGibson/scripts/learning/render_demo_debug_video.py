@@ -130,6 +130,67 @@ def _segment_for_frame(segments: list[dict], frame_idx: int) -> dict:
     return segments[-1]
 
 
+def _segment_index_for_frame(segments: list[dict], frame_idx: int) -> int:
+    for idx, segment in enumerate(segments):
+        start, end = segment["frame_duration"]
+        if start <= frame_idx < end:
+            return idx
+    return len(segments) - 1
+
+
+def _subtask_content(subtask: str | None) -> str | None:
+    if subtask is None:
+        return None
+    text = " ".join(str(subtask).strip().split())
+    if text.startswith("Subtask:"):
+        text = text.removeprefix("Subtask:").strip()
+    return text.rstrip(".!?").strip() or None
+
+
+def _finish_sentence(text: str | None) -> str | None:
+    if text is None:
+        return None
+    text = " ".join(text.strip().split())
+    if not text:
+        return None
+    return text if text[-1] in ".!?" else f"{text}."
+
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:] if text else text
+
+
+def _is_navigation_subtask(subtask: str | None) -> bool:
+    content = _subtask_content(subtask)
+    return bool(content and content.startswith("Move to "))
+
+
+def _macro_nav_manipulation_subtasks(mapped_subtasks: list[str | None]) -> list[str | None]:
+    macro_subtasks = list(mapped_subtasks)
+    idx = 0
+    while idx + 1 < len(mapped_subtasks):
+        current = mapped_subtasks[idx]
+        next_subtask = mapped_subtasks[idx + 1]
+        current_content = _subtask_content(current)
+        next_content = _subtask_content(next_subtask)
+        if current_content and next_content and _is_navigation_subtask(current) and not _is_navigation_subtask(next_subtask):
+            macro = _finish_sentence(f"{current_content} and {_lower_first(next_content)}")
+            macro_subtasks[idx] = macro
+            macro_subtasks[idx + 1] = macro
+            idx += 2
+            continue
+        idx += 1
+    return macro_subtasks
+
+
+def _build_prompt(task_prompt: str, mapped_subtask: str | None, prompt_mode: str) -> str:
+    if prompt_mode == "subtask_only":
+        return _subtask_content(mapped_subtask) or ""
+    if prompt_mode == "long_task_subtask":
+        return task_progress_lib.inject_subtask_block(task_prompt, mapped_subtask)
+    raise ValueError(f"Unsupported debug prompt_mode={prompt_mode!r}.")
+
+
 def _read_rgb(cap: cv2.VideoCapture, *, camera_name: str, frame_idx: int) -> np.ndarray:
     ok, bgr = cap.read()
     if not ok:
@@ -167,6 +228,8 @@ def render_demo_debug_video(
     output_fps: int,
     max_frames: int | None,
     mapping_path: pathlib.Path | None,
+    prompt_mode: str,
+    macro_subtasks: bool,
 ) -> None:
     task_dir = f"task-{task_index:04d}"
     episode_stem = f"episode_{episode_id:08d}"
@@ -195,6 +258,16 @@ def render_demo_debug_video(
         if max_frames is not None:
             frame_count = min(frame_count, max_frames * stride)
         selected_annotation_source, segments = _select_annotation_segments(annotation, annotation_source, frame_count)
+        mapped_subtasks = [
+            task_mapping.subtask_for_annotation(
+                selected_annotation_source,
+                segment,
+                with_prefix=False,
+            )
+            for segment in segments
+        ]
+        if macro_subtasks:
+            mapped_subtasks = _macro_nav_manipulation_subtasks(mapped_subtasks)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         container = av.open(str(output_path), mode="w")
@@ -217,17 +290,14 @@ def render_demo_debug_video(
                 left_wrist = _read_rgb(caps["left_wrist"], camera_name="left_wrist", frame_idx=frame_idx)
                 right_wrist = _read_rgb(caps["right_wrist"], camera_name="right_wrist", frame_idx=frame_idx)
 
-                segment = _segment_for_frame(segments, frame_idx)
+                segment_idx = _segment_index_for_frame(segments, frame_idx)
+                segment = segments[segment_idx]
                 segment_id = tuple(segment["frame_duration"])
                 if segment_id != last_segment_id:
                     last_segment_id = segment_id
 
-                mapped_subtask = task_mapping.subtask_for_annotation(
-                    selected_annotation_source,
-                    segment,
-                    with_prefix=False,
-                )
-                prompt = task_progress_lib.inject_subtask_block(task_prompt, mapped_subtask)
+                mapped_subtask = mapped_subtasks[segment_idx]
+                prompt = _build_prompt(task_prompt, mapped_subtask, prompt_mode)
                 left_wrist, right_wrist, head = resize_debug_video_views(
                     left_wrist_rgb=left_wrist,
                     right_wrist_rgb=right_wrist,
@@ -239,6 +309,7 @@ def render_demo_debug_video(
                     head_rgb=head,
                     header_lines=[
                         f"task: {task_name} | episode: {episode_id} | frame: {frame_idx}",
+                        f"prompt_mode: {prompt_mode} | macro_subtasks: {macro_subtasks}",
                     ],
                     context_label="primitive/skill (from demo)",
                     context_value=None,
@@ -262,6 +333,8 @@ def render_demo_debug_video(
                     "selected_annotation_source": selected_annotation_source,
                     "stride": stride,
                     "output_fps": output_fps,
+                    "prompt_mode": prompt_mode,
+                    "macro_subtasks": macro_subtasks,
                 },
                 sort_keys=True,
             )
@@ -291,6 +364,8 @@ def main() -> None:
     parser.add_argument("--output-fps", type=int, default=30)
     parser.add_argument("--max-frames", type=int, default=None, help="Maximum written frames after striding.")
     parser.add_argument("--mapping-path", type=pathlib.Path, default=None)
+    parser.add_argument("--prompt-mode", choices=("long_task_subtask", "subtask_only"), default="long_task_subtask")
+    parser.add_argument("--macro-subtasks", action="store_true")
     args = parser.parse_args()
     if args.stride < 1:
         raise ValueError("--stride must be >= 1")
@@ -307,6 +382,8 @@ def main() -> None:
         output_fps=args.output_fps,
         max_frames=args.max_frames,
         mapping_path=args.mapping_path.expanduser() if args.mapping_path is not None else None,
+        prompt_mode=args.prompt_mode,
+        macro_subtasks=args.macro_subtasks,
     )
 
 

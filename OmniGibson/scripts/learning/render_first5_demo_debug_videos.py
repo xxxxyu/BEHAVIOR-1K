@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import pathlib
 import sys
 import time
 
+import cv2
+
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from render_demo_debug_video import render_demo_debug_video  # noqa: E402
+from render_demo_debug_video import CAMERA_DIRS  # noqa: E402
+from render_demo_debug_video import _finish_sentence  # noqa: E402
+from render_demo_debug_video import _format_demo_segment_lines  # noqa: E402
+from render_demo_debug_video import _macro_nav_manipulation_subtasks  # noqa: E402
+from render_demo_debug_video import _select_annotation_segments  # noqa: E402
+from render_demo_debug_video import _subtask_content  # noqa: E402
+from render_demo_debug_video import behavior_subtask_mapping  # noqa: E402
 
 
 def _episode_id_from_stem(stem: str) -> int:
@@ -25,7 +35,75 @@ def _task_name_from_annotation(annotation_path: pathlib.Path) -> str:
     return str(task_name)
 
 
-def _write_index(output_root: pathlib.Path, records: list[dict]) -> None:
+def _source_frame_count(dataset_root: pathlib.Path, task_dir: str, episode_stem: str) -> int:
+    frame_counts = []
+    for camera_dir in CAMERA_DIRS.values():
+        path = dataset_root / "videos" / task_dir / camera_dir / f"{episode_stem}.mp4"
+        cap = cv2.VideoCapture(str(path))
+        try:
+            frame_counts.append(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+        finally:
+            cap.release()
+    if not frame_counts or min(frame_counts) <= 0:
+        raise RuntimeError(f"Failed to read source frame count for {task_dir}/{episode_stem}.")
+    return min(frame_counts)
+
+
+def _display_subtask(subtask: str | None) -> str:
+    normalized = _finish_sentence(_subtask_content(subtask))
+    return normalized if normalized is not None else "[unmapped or excluded]"
+
+
+def _episode_subtask_rows(
+    *,
+    dataset_root: pathlib.Path,
+    record: dict,
+    mapping: behavior_subtask_mapping.BehaviorSubtaskMapping,
+    annotation_source: str,
+) -> list[dict[str, str]]:
+    task_name = record.get("task_name", "unknown")
+    task_mapping = mapping.get(task_name)
+    if task_mapping is None:
+        return []
+
+    task_dir = str(record["task_dir"])
+    episode_stem = str(record["episode"])
+    annotation_path = dataset_root / "annotations" / task_dir / f"{episode_stem}.json"
+    with annotation_path.open(encoding="utf-8") as f:
+        annotation = json.load(f)
+    frame_count = _source_frame_count(dataset_root, task_dir, episode_stem)
+    selected_source, segments = _select_annotation_segments(annotation, annotation_source, frame_count)
+    mapped_subtasks = [
+        task_mapping.subtask_for_annotation(selected_source, segment, with_prefix=False)
+        for segment in segments
+    ]
+    macro_subtasks = _macro_nav_manipulation_subtasks(mapped_subtasks)
+
+    rows: list[dict[str, str]] = []
+    for idx, (segment, mapped, macro) in enumerate(zip(segments, mapped_subtasks, macro_subtasks, strict=True)):
+        demo_lines = _format_demo_segment_lines(segment, selected_source)
+        frame_start, frame_end = segment["frame_duration"]
+        rows.append(
+            {
+                "idx": str(idx),
+                "frames": f"{frame_start}-{frame_end}",
+                "demo": " | ".join(demo_lines),
+                "mapped": _display_subtask(mapped),
+                "macro": _display_subtask(macro),
+            }
+        )
+    return rows
+
+
+def _write_index(
+    output_root: pathlib.Path,
+    records: list[dict],
+    *,
+    dataset_root: pathlib.Path,
+    mapping: behavior_subtask_mapping.BehaviorSubtaskMapping,
+    annotation_source: str,
+    macro_subtasks: bool,
+) -> None:
     videos_by_task: dict[str, list[dict]] = {}
     for record in records:
         if record.get("status") != "ok":
@@ -45,25 +123,55 @@ def _write_index(output_root: pathlib.Path, records: list[dict]) -> None:
         ".card{background:white;border:1px solid #ddd;border-radius:6px;padding:10px}",
         "video{width:100%;height:auto;background:#111}",
         ".meta{font-size:13px;color:#555;margin:6px 0 8px}",
+        "table.subtasks{border-collapse:collapse;width:100%;margin:8px 0 10px;background:#fff}",
+        "table.subtasks th,table.subtasks td{border:1px solid #ddd;padding:5px 6px;vertical-align:top;font-size:12px;line-height:1.3}",
+        "table.subtasks th{background:#eee}",
+        ".demo{color:#555}",
+        ".missing{color:#9a3412;font-weight:600}",
         "</style>",
         "</head>",
         "<body>",
         "<h1>BEHAVIOR Demo Subtask Debug Videos</h1>",
-        f"<p>{len(records)} rendered records, grouped by task. Overlay shows demo annotation and mapped subtask.</p>",
+        f"<p>{len(records)} rendered records, grouped by task. Each video is preceded by the exact segment-order demo annotation, mapped subtask, and adjacent-only macro subtask used by macro debug overlays.</p>",
     ]
     for task_dir in sorted(videos_by_task):
         task_records = sorted(videos_by_task[task_dir], key=lambda item: item["episode"])
         task_name = task_records[0].get("task_name", "unknown")
-        lines.append(f"<h2>{task_dir}: {task_name}</h2>")
+        lines.append(f"<h2>{html.escape(task_dir)}: {html.escape(task_name)}</h2>")
         lines.append('<div class="grid">')
         for record in task_records:
             video_path = pathlib.Path(record["output_path"])
             rel_path = video_path.relative_to(output_root)
+            rows = _episode_subtask_rows(
+                dataset_root=dataset_root,
+                record=record,
+                mapping=mapping,
+                annotation_source=annotation_source,
+            )
             lines.extend(
                 [
                     '<div class="card">',
-                    f'<div class="meta">{record["episode"]}</div>',
-                    f'<video controls preload="metadata" src="{rel_path.as_posix()}"></video>',
+                    f'<div class="meta">{html.escape(record["episode"])}</div>',
+                    '<table class="subtasks">',
+                    "<tr><th>#</th><th>frames</th><th>demo annotation</th><th>mapped subtask</th><th>macro subtask</th></tr>",
+                ]
+            )
+            for row in rows:
+                mapped_cls = "missing" if row["mapped"].startswith("[") else ""
+                macro_cls = "missing" if row["macro"].startswith("[") else ""
+                lines.append(
+                    "<tr>"
+                    f"<td>{html.escape(row['idx'])}</td>"
+                    f"<td>{html.escape(row['frames'])}</td>"
+                    f"<td class=\"demo\">{html.escape(row['demo'])}</td>"
+                    f"<td class=\"{mapped_cls}\">{html.escape(row['mapped'])}</td>"
+                    f"<td class=\"{macro_cls}\">{html.escape(row['macro'])}</td>"
+                    "</tr>"
+                )
+            lines.extend(
+                [
+                    "</table>",
+                    f'<video controls preload="metadata" src="{html.escape(rel_path.as_posix())}"></video>',
                     "</div>",
                 ]
             )
@@ -89,16 +197,22 @@ def main() -> None:
     parser.add_argument("--output-fps", type=int, default=30)
     parser.add_argument("--annotation-source", choices=("auto", "primitive_annotation", "skill_annotation"), default="auto")
     parser.add_argument("--mapping-path", type=pathlib.Path, default=None)
+    parser.add_argument("--prompt-mode", choices=("long_task_subtask", "subtask_only"), default="long_task_subtask")
+    parser.add_argument("--macro-subtasks", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     dataset_root = args.dataset_root.expanduser()
     output_root = args.output_root.expanduser()
+    mapping = behavior_subtask_mapping.load_behavior_subtask_mapping(
+        args.mapping_path.expanduser() if args.mapping_path is not None else None
+    )
     video_root = output_root / "debug_videos"
     manifest_path = output_root / "manifest.jsonl"
     failures_path = output_root / "failures.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     rendered_ok = set()
+    existing_records_by_output = {}
     if manifest_path.exists() and not args.overwrite:
         with manifest_path.open(encoding="utf-8") as f:
             for line in f:
@@ -107,6 +221,7 @@ def main() -> None:
                 record = json.loads(line)
                 if record.get("status") == "ok":
                     rendered_ok.add(record.get("output_path"))
+                    existing_records_by_output[record.get("output_path")] = record
 
     annotation_tasks = sorted((dataset_root / "annotations").glob("task-*"))
     jobs = []
@@ -126,6 +241,9 @@ def main() -> None:
             output_path = video_root / task_dir_name / f"{episode_stem}.mp4"
             if output_path.exists() and not args.overwrite and str(output_path) in rendered_ok:
                 skipped += 1
+                existing_record = existing_records_by_output.get(str(output_path))
+                if existing_record is not None:
+                    records.append(existing_record)
                 continue
 
             record = {
@@ -149,6 +267,8 @@ def main() -> None:
                     output_fps=args.output_fps,
                     max_frames=None,
                     mapping_path=args.mapping_path.expanduser() if args.mapping_path is not None else None,
+                    prompt_mode=args.prompt_mode,
+                    macro_subtasks=args.macro_subtasks,
                 )
                 successes += 1
                 ok_record = {**record, "task_name": task_name, "status": "ok"}
@@ -171,7 +291,14 @@ def main() -> None:
                     flush=True,
                 )
 
-    _write_index(output_root, records)
+    _write_index(
+        output_root,
+        records,
+        dataset_root=dataset_root,
+        mapping=mapping,
+        annotation_source=args.annotation_source,
+        macro_subtasks=args.macro_subtasks,
+    )
     print(
         json.dumps(
             {
