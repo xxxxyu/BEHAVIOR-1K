@@ -96,6 +96,14 @@ def _normalize_task_progress(task_progress: dict | None) -> dict | None:
     return normalized
 
 
+def _task_progress_value_is_satisfied(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    return bool(value)
+
+
 def _close_video_writer(video_writer: tuple[Container, Stream] | None) -> None:
     if video_writer is None:
         return
@@ -135,6 +143,8 @@ class Evaluator:
         self._inference_log_offset = 0
         self._inference_log_fallback_logged = False
         self._debug_video_shape_logged = False
+        self._current_rollout_metadata = None
+        self._current_task_progress_summary = None
 
         self.env = self.load_env(env_wrapper=self.cfg.env_wrapper)
         self.policy = self.load_policy()
@@ -152,6 +162,160 @@ class Evaluator:
             np.random.seed(self.cfg.perturb_pose_seed)
 
         logger.info(f"{self.cfg=}")
+
+    def _inference_log_path(self) -> Path:
+        return Path(self.cfg.log_path) / "inference_prompts.jsonl"
+
+    def _inference_log_size(self) -> int:
+        log_path = self._inference_log_path()
+        try:
+            return log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _task_progress_fraction(self, task_progress: dict | None) -> dict[str, Any] | None:
+        task_progress = _normalize_task_progress(task_progress)
+        if not task_progress:
+            return None
+
+        if self._current_task_progress_summary is None:
+            return None
+
+        initial = self._current_task_progress_summary.get("initial_state") or {}
+        trackable_keys = [
+            key for key, initial_value in initial.items() if not _task_progress_value_is_satisfied(initial_value)
+        ]
+        if not trackable_keys:
+            trackable_keys = list(task_progress.keys())
+
+        satisfied_keys = [
+            key
+            for key in trackable_keys
+            if key in task_progress and _task_progress_value_is_satisfied(task_progress[key])
+        ]
+        denominator = len(trackable_keys)
+        fraction = len(satisfied_keys) / denominator if denominator else 0.0
+        return {
+            "fraction": fraction,
+            "percent": fraction * 100.0,
+            "satisfied": len(satisfied_keys),
+            "total": denominator,
+            "satisfied_keys": satisfied_keys,
+            "trackable_keys": trackable_keys,
+        }
+
+    def _update_task_progress_summary(self, task_progress: dict | None) -> None:
+        if self._current_task_progress_summary is None:
+            return
+        task_progress = _normalize_task_progress(task_progress)
+        if not task_progress:
+            return
+
+        current = self._task_progress_fraction(task_progress)
+        if current is None:
+            return
+
+        self._current_task_progress_summary["final_state"] = dict(task_progress)
+        self._current_task_progress_summary["final_fraction"] = current["fraction"]
+        self._current_task_progress_summary["final_percent"] = current["percent"]
+        if current["fraction"] >= self._current_task_progress_summary["max_fraction"]:
+            self._current_task_progress_summary.update(
+                {
+                    "max_fraction": current["fraction"],
+                    "max_percent": current["percent"],
+                    "max_satisfied": current["satisfied"],
+                    "total_trackable": current["total"],
+                    "max_satisfied_keys": current["satisfied_keys"],
+                    "trackable_keys": current["trackable_keys"],
+                    "max_state": dict(task_progress),
+                }
+            )
+
+    def begin_rollout_metadata(self, instance_id: int, episode_id: int, rollout_paths: dict | None = None) -> None:
+        initial_task_progress = _normalize_task_progress(self.latest_task_progress) or {}
+        self._current_task_progress_summary = {
+            "initial_state": dict(initial_task_progress),
+            "final_state": dict(initial_task_progress),
+            "max_state": dict(initial_task_progress),
+            "final_fraction": 0.0,
+            "final_percent": 0.0,
+            "max_fraction": 0.0,
+            "max_percent": 0.0,
+            "max_satisfied": 0,
+            "total_trackable": 0,
+            "max_satisfied_keys": [],
+            "trackable_keys": [],
+        }
+        self._update_task_progress_summary(initial_task_progress)
+        self._current_rollout_metadata = {
+            "task_name": self.cfg.task.name,
+            "instance_id": int(instance_id),
+            "episode_id": int(episode_id),
+            "inference_log_path": str(self._inference_log_path()),
+            "inference_log_start_byte": self._inference_log_size(),
+            "rollout_paths": dict(rollout_paths or {}),
+        }
+
+    def _summarize_inference_log_slice(self, start_byte: int, end_byte: int) -> dict[str, Any]:
+        log_path = self._inference_log_path()
+        summary = {
+            "path": str(log_path),
+            "start_byte": start_byte,
+            "end_byte": end_byte,
+            "records": 0,
+            "inference_index_min": None,
+            "inference_index_max": None,
+            "mapped_subtasks": {},
+            "first_prompts": [],
+        }
+        if end_byte <= start_byte or not log_path.exists():
+            return summary
+
+        try:
+            with log_path.open("rb") as f:
+                f.seek(start_byte)
+                payload = f.read(end_byte - start_byte).decode("utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning(f"Failed to summarize inference prompt log {log_path}: {exc}")
+            return summary
+
+        indices = []
+        mapped_subtasks = {}
+        first_prompts = []
+        for line in payload.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("event") != "infer":
+                continue
+            summary["records"] += 1
+            inference_index = record.get("inference_index")
+            if isinstance(inference_index, int):
+                indices.append(inference_index)
+            mapped_subtask = record.get("mapped_subtask")
+            if isinstance(mapped_subtask, str):
+                mapped_subtasks[mapped_subtask] = mapped_subtasks.get(mapped_subtask, 0) + 1
+            prompt = record.get("prompt")
+            if isinstance(prompt, str) and len(first_prompts) < 5:
+                first_prompts.append(prompt)
+        if indices:
+            summary["inference_index_min"] = min(indices)
+            summary["inference_index_max"] = max(indices)
+        summary["mapped_subtasks"] = mapped_subtasks
+        summary["first_prompts"] = first_prompts
+        return summary
+
+    def finalize_rollout_metadata(self) -> dict[str, Any]:
+        metadata = dict(self._current_rollout_metadata or {})
+        start_byte = int(metadata.get("inference_log_start_byte", 0) or 0)
+        end_byte = self._inference_log_size()
+        metadata["inference_log_end_byte"] = end_byte
+        metadata["inference_log"] = self._summarize_inference_log_slice(start_byte, end_byte)
+        metadata["task_progress"] = dict(self._current_task_progress_summary or {})
+        return metadata
 
     def load_env(self, env_wrapper: DictConfig) -> EnvironmentWrapper:
         """
@@ -400,6 +564,7 @@ class Evaluator:
 
         self.latest_task_progress = task_progress
         self._last_logged_task_progress = dict(task_progress)
+        self._update_task_progress_summary(task_progress)
 
     def _attach_task_progress_to_obs(self, obs: dict) -> dict:
         if self.cfg.check_task_progress and self.latest_task_progress is not None:
@@ -736,9 +901,9 @@ if __name__ == "__main__":
                         resolution=DEBUG_VIDEO_RESOLUTION,
                     )
 
+                rollout_paths = {}
                 if config.save_rollout:
                     rollout_video_writers = {}
-                    rollout_paths = {}
                     for camera_name in ROLLOUT_CAMERA_NAMES:
                         rollout_id_path = Path(rollout_path) / f"{int(idx):04d}_{int(epi):04d}"
                         rollout_id_path.mkdir(parents=True, exist_ok=True)
@@ -753,6 +918,8 @@ if __name__ == "__main__":
                     evaluator.rollout_paths = rollout_paths
                     evaluator.rollout_state_action = {"state": [], "action": []}
                     logger.info(f"Created rollout video writers under {rollout_id_path}")
+
+                evaluator.begin_rollout_metadata(idx, epi, rollout_paths=rollout_paths)
 
                 # run metric start callbacks
                 for metric in evaluator.metrics:
@@ -794,6 +961,9 @@ if __name__ == "__main__":
                 # gather metric results and write to file
                 for metric in evaluator.metrics:
                     metrics.update(metric.gather_results())
+                metrics["rollout"] = evaluator.finalize_rollout_metadata()
+                metrics["task_progress"] = metrics["rollout"]["task_progress"]
+                metrics["inference_log"] = metrics["rollout"]["inference_log"]
                 with open(metrics_path / f"{config.task.name}_{idx}_{epi}.json", "w") as f:
                     json.dump(metrics, f)
                 # reset video writer
