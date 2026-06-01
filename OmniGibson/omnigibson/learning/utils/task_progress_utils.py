@@ -21,6 +21,76 @@ ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
 PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
 
 
+class _ProgressObject:
+    """Thin adapter for scene objects that are not present in task.object_scope."""
+
+    def __init__(self, obj):
+        self._obj = obj
+
+    @property
+    def exists(self):
+        return self._obj is not None
+
+    @property
+    def unwrapped(self):
+        return getattr(self._obj, "unwrapped", self._obj)
+
+
+def _category_candidates_from_key(key):
+    # Convert BDDL-style instance keys such as toilet.n.01_1 to OG category
+    # candidates such as toilet.
+    stem, _, suffix = key.rpartition("_")
+    if not suffix.isdigit():
+        stem = key
+    if ".n." in stem:
+        stem = stem.split(".n.", 1)[0]
+    return [stem] if stem else []
+
+
+def _instance_index_from_key(key):
+    _, _, suffix = key.rpartition("_")
+    return int(suffix) - 1 if suffix.isdigit() else 0
+
+
+def _resolve_object(env, key):
+    objs = env.task.object_scope
+    if key in objs:
+        return objs[key]
+
+    scene = getattr(env, "scene", None)
+    if scene is not None:
+        obj = scene.object_registry("name", key, None)
+        if obj is not None:
+            return _ProgressObject(obj)
+
+        for category in _category_candidates_from_key(key):
+            matches = list(scene.object_registry("category", category, default_val=[]))
+            if matches:
+                matches = sorted(matches, key=lambda obj: getattr(obj, "name", ""))
+                idx = min(_instance_index_from_key(key), len(matches) - 1)
+                return _ProgressObject(matches[idx])
+
+    raise KeyError(f"Could not resolve object key for task progress: {key}")
+
+
+def _resolve_category_objects(env, category_key):
+    objs = env.task.object_scope
+    results = []
+    for inst, category in env.task.object_instance_to_category.items():
+        if category == category_key and inst in objs:
+            results.append(objs[inst])
+    if results:
+        return results
+
+    scene = getattr(env, "scene", None)
+    if scene is not None:
+        for category in _category_candidates_from_key(category_key):
+            for obj in scene.object_registry("category", category, default_val=[]):
+                results.append(_ProgressObject(obj))
+
+    return results
+
+
 def _object_open_fraction(obj):
     open_state = obj.unwrapped.states[Open]
     if open_state.relevant_joints_info is None:
@@ -48,23 +118,22 @@ def _object_open_fraction(obj):
 def _check_state_spec(env, spec):
     objs = env.task.object_scope
     if len(spec) == 4 and isinstance(spec[3], bool):
-        obj = objs[spec[1]]
+        obj = _resolve_object(env, spec[1])
         return obj.exists and obj.unwrapped.states[spec[2]].get_value() == spec[3]
     if len(spec) == 5:
         if spec[3] not in objs:
             # Special case: e.g. category "tree.n.01" is not in object scope.
-            all_instances = [
-                inst for inst, category in env.task.object_instance_to_category.items() if category == spec[3]
-            ]
+            all_instances = _resolve_category_objects(env, spec[3])
             assert len(all_instances) > 0, f"Could not find any instances for category {spec[3]}"
-            obj1 = objs[spec[1]]
-            return any(
+            obj1 = _resolve_object(env, spec[1])
+            matches = [
                 obj1.exists
-                and objs[inst].exists
-                and obj1.unwrapped.states[spec[2]].get_value(objs[inst].unwrapped) == spec[4]
-                for inst in all_instances
-            )
-        obj1, obj2 = objs[spec[1]], objs[spec[3]]
+                and obj2.exists
+                and obj1.unwrapped.states[spec[2]].get_value(obj2.unwrapped) == spec[4]
+                for obj2 in all_instances
+            ]
+            return any(matches) if spec[4] else all(matches)
+        obj1, obj2 = _resolve_object(env, spec[1]), _resolve_object(env, spec[3])
         return (
             obj1.exists
             and obj2.exists
@@ -75,7 +144,6 @@ def _check_state_spec(env, spec):
 
 def check_progress(env, check_specs):
     """Generic progress checker using declarative specs."""
-    objs = env.task.object_scope
     results = {}
 
     for name, spec in check_specs.items():
@@ -83,7 +151,12 @@ def check_progress(env, check_specs):
 
         if check_type == "near":
             # ("near", robot_key, obj_key) - robot should always be first
-            robot, obj = objs[spec[1]].unwrapped, objs[spec[2]].unwrapped
+            robot_entity = _resolve_object(env, spec[1])
+            obj_entity = _resolve_object(env, spec[2])
+            if not (robot_entity.exists and obj_entity.exists):
+                results[name] = False
+                continue
+            robot, obj = robot_entity.unwrapped, obj_entity.unwrapped
 
             # Get all robot links to check: root_link and all eef_links
             robot_links_to_check = [robot.root_link] + list(robot.eef_links.values())
@@ -117,7 +190,7 @@ def check_progress(env, check_specs):
 
         elif check_type == "grasping":
             # ("grasping", robot_key, obj_key, expected_bool) - robot is grasping object
-            robot, obj = objs[spec[1]], objs[spec[2]]
+            robot, obj = _resolve_object(env, spec[1]), _resolve_object(env, spec[2])
             results[name] = (
                 robot.exists
                 and obj.exists
@@ -126,7 +199,7 @@ def check_progress(env, check_specs):
 
         elif check_type == "open_fraction":
             # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
-            obj = objs[spec[1]]
+            obj = _resolve_object(env, spec[1])
             results[name] = (
                 obj.exists
                 and (_object_open_fraction(obj) >= spec[2]) == spec[3]
@@ -135,7 +208,12 @@ def check_progress(env, check_specs):
         elif check_type == "exists":
             # ("exists", obj_key, expected_bool) - check if object exists
             if len(spec) == 3 and isinstance(spec[2], bool):
-                results[name] = objs[spec[1]].exists == spec[2]
+                try:
+                    obj = _resolve_object(env, spec[1])
+                    exists = obj.exists
+                except KeyError:
+                    exists = False
+                results[name] = exists == spec[2]
             else:
                 raise ValueError(f"Invalid exists spec: {spec}")
 
@@ -247,6 +325,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
             "robot_near_sink": ("near", "agent.n.01_1", "sink.n.01_1"),
+            "robot_near_toilet": ("near", "agent.n.01_1", "toilet.n.01_1"),
             "mousetrap_1_picked_up": ("state", "mousetrap.n.01_1", OnTop, "cabinet.n.01_1", False),
             "mousetrap_2_picked_up": ("state", "mousetrap.n.01_2", OnTop, "cabinet.n.01_1", False),
             "mousetrap_3_picked_up": ("state", "mousetrap.n.01_3", OnTop, "cabinet.n.01_1", False),
@@ -257,6 +336,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "mousetrap_4_on_floor": ("state", "mousetrap.n.01_4", OnTop, "floor.n.01_1", True),
             "mousetrap_1_near_sink": ("state", "mousetrap.n.01_1", Under, "sink.n.01_1", True),
             "mousetrap_2_near_sink": ("state", "mousetrap.n.01_2", Under, "sink.n.01_1", True),
+            "mousetrap_3_under_toilet": ("state", "mousetrap.n.01_3", Under, "toilet.n.01_1", True),
+            "mousetrap_4_under_toilet": ("state", "mousetrap.n.01_4", Under, "toilet.n.01_1", True),
         },
     ),
     "hiding_Easter_eggs": lambda env: check_progress(
@@ -696,7 +777,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "sanitary_napkins_on_shelf": ("state", "box__of__sanitary_napkin.n.01_1", OnTop, "shelf.n.01_1", True),
             "soap_dispenser_on_sink": ("state", "soap_dispenser.n.01_1", OnTop, "sink.n.01_1", True),
             "toothbrush_in_cup": ("state", "toothbrush.n.01_1", Inside, "cup.n.01_1", True),
-            "toothpaste_near_cup": ("state", "tube__of__toothpaste.n.01_1", NextTo, "cup.n.01_1", True),
+            "toothpaste_in_cup": ("state", "tube__of__toothpaste.n.01_1", Inside, "cup.n.01_1", True),
         },
     ),
     "getting_organized_for_work": lambda env: check_progress(
@@ -725,6 +806,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_desk": ("near", "agent.n.01_1", "desk.n.01_1"),
             "robot_near_bookcase": ("near", "agent.n.01_1", "bookcase.n.01_1"),
             "robot_near_bed": ("near", "agent.n.01_1", "bed.n.01_1"),
+            "robot_near_pencil_box": ("near", "agent.n.01_1", "pencil_box.n.01_1"),
             "folder_1_picked_up": ("state", "folder.n.02_1", OnTop, "desk.n.01_1", False),
             "folder_2_picked_up": ("state", "folder.n.02_2", OnTop, "chair.n.01_1", False),
             "folder_1_in_bookcase": ("state", "folder.n.02_1", Inside, "bookcase.n.01_1", True),
@@ -827,7 +909,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "hanging_pictures": lambda env: check_progress(
         env,
         {
-            "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
+            "robot_near_poster": ("near", "agent.n.01_1", "poster.n.01_1"),
             "robot_near_wall_nail": ("near", "agent.n.01_1", "wall_nail.n.01_1"),
             "poster_picked_up": ("state", "poster.n.01_1", OnTop, "countertop.n.01_1", False),
             "poster_attached_to_nail": ("state", "poster.n.01_1", AttachedTo, "wall_nail.n.01_1", True),
@@ -891,7 +973,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
-            "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
+            "robot_near_popcorn_bag": ("near", "agent.n.01_1", "popcorn__bag.n.01_1"),
             "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "popcorn_bag_picked_up": ("state", "popcorn__bag.n.01_1", OnTop, "countertop.n.01_1", False),
             "popcorn_bag_in_microwave": ("state", "popcorn__bag.n.01_1", Inside, "microwave.n.02_1", True),
@@ -926,7 +1008,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
             "robot_near_sink": ("near", "agent.n.01_1", "sink.n.01_1"),
             "board_picked_up": ("state", "chopping_board.n.01_1", OnTop, "countertop.n.01_1", False),
-            "board_placed_near_sink": ("state", "chopping_board.n.01_1", NextTo, "sink.n.01_1", True),
+            "board_placed_near_bowl": ("state", "chopping_board.n.01_1", NextTo, "bowl.n.01_1", True),
             "parer_picked_up": ("state", "parer.n.02_1", OnTop, "countertop.n.01_1", False),
             "onion_picked_up": ("state", "vidalia_onion.n.01_1", Inside, "sink.n.01_1", False),
             "onion_on_board": ("state", "vidalia_onion.n.01_1", OnTop, "chopping_board.n.01_1", True),
