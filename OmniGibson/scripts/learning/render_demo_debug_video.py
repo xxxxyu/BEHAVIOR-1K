@@ -27,6 +27,7 @@ _debug_video_utils = importlib.util.module_from_spec(_debug_video_spec)
 _debug_video_spec.loader.exec_module(_debug_video_utils)
 
 DEBUG_VIDEO_RESOLUTION = _debug_video_utils.DEBUG_VIDEO_RESOLUTION
+DEBUG_VIDEO_TEXT_HEIGHT = _debug_video_utils.DEBUG_VIDEO_TEXT_HEIGHT
 build_debug_video_frame = _debug_video_utils.build_debug_video_frame
 resize_debug_video_views = _debug_video_utils.resize_debug_video_views
 
@@ -122,20 +123,20 @@ def _select_annotation_segments(annotation: dict, requested_source: str, frame_c
     raise ValueError(f"No valid annotation segments found for source={requested_source!r}, frame_count={frame_count}.")
 
 
-def _segment_for_frame(segments: list[dict], frame_idx: int) -> dict:
+def _segment_for_frame(segments: list[dict], frame_idx: int) -> dict | None:
     for segment in segments:
         start, end = segment["frame_duration"]
         if start <= frame_idx < end:
             return segment
-    return segments[-1]
+    return None
 
 
-def _segment_index_for_frame(segments: list[dict], frame_idx: int) -> int:
+def _segment_index_for_frame(segments: list[dict], frame_idx: int) -> int | None:
     for idx, segment in enumerate(segments):
         start, end = segment["frame_duration"]
         if start <= frame_idx < end:
             return idx
-    return len(segments) - 1
+    return None
 
 
 def _subtask_content(subtask: str | None) -> str | None:
@@ -216,6 +217,48 @@ def _close_writer(container: av.container.OutputContainer, stream: av.video.stre
     container.close()
 
 
+def _target_debug_sizes(caps: dict[str, cv2.VideoCapture], *, high_resolution: bool) -> tuple[int, int, int]:
+    if not high_resolution:
+        return DEBUG_VIDEO_RESOLUTION[0], DEBUG_VIDEO_RESOLUTION[1], DEBUG_VIDEO_TEXT_HEIGHT
+
+    head_width = int(caps["head"].get(cv2.CAP_PROP_FRAME_WIDTH))
+    head_height = int(caps["head"].get(cv2.CAP_PROP_FRAME_HEIGHT))
+    head_size = min(head_width, head_height)
+    if head_size <= 0:
+        raise RuntimeError("Failed to read head camera resolution.")
+    wrist_size = max(1, head_size // 2)
+    text_height = 104
+    return text_height + head_size, wrist_size + head_size, text_height
+
+
+def _resize_views_for_mode(
+    *,
+    left_wrist_rgb: np.ndarray,
+    right_wrist_rgb: np.ndarray,
+    head_rgb: np.ndarray,
+    high_resolution: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not high_resolution:
+        return resize_debug_video_views(
+            left_wrist_rgb=left_wrist_rgb,
+            right_wrist_rgb=right_wrist_rgb,
+            head_rgb=head_rgb,
+        )
+
+    head_size = min(head_rgb.shape[0], head_rgb.shape[1])
+    wrist_size = max(1, head_size // 2)
+    return (
+        cv2.resize(left_wrist_rgb[..., :3], (wrist_size, wrist_size)),
+        cv2.resize(right_wrist_rgb[..., :3], (wrist_size, wrist_size)),
+        cv2.resize(head_rgb[..., :3], (head_size, head_size)),
+    )
+
+
+def _display_subtask(mapped_subtask: str | None) -> str:
+    content = _subtask_content(mapped_subtask)
+    return content if content is not None else ""
+
+
 def render_demo_debug_video(
     *,
     dataset_root: pathlib.Path,
@@ -230,6 +273,11 @@ def render_demo_debug_video(
     mapping_path: pathlib.Path | None,
     prompt_mode: str,
     macro_subtasks: bool,
+    high_resolution: bool = False,
+    lossless: bool = False,
+    include_prompt: bool = True,
+    overlay_mode: str = "debug",
+    target_bitrate: int | None = None,
 ) -> None:
     task_dir = f"task-{task_index:04d}"
     episode_stem = f"episode_{episode_id:08d}"
@@ -270,11 +318,19 @@ def render_demo_debug_video(
             mapped_subtasks = _macro_nav_manipulation_subtasks(mapped_subtasks)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_height, output_width, text_height = _target_debug_sizes(caps, high_resolution=high_resolution)
         container = av.open(str(output_path), mode="w")
         stream = container.add_stream("libx264", rate=output_fps)
-        stream.height = DEBUG_VIDEO_RESOLUTION[0]
-        stream.width = DEBUG_VIDEO_RESOLUTION[1]
-        stream.pix_fmt = "yuv420p"
+        stream.height = output_height
+        stream.width = output_width
+        if lossless:
+            stream.pix_fmt = "yuv444p"
+            stream.options = {"crf": "0", "preset": "veryslow"}
+        else:
+            stream.pix_fmt = "yuv420p"
+            if target_bitrate is not None:
+                stream.bit_rate = target_bitrate
+                stream.options = {"preset": "slow", "profile": "high"}
 
         written = 0
         last_segment_id: tuple[int, int] | None = None
@@ -291,17 +347,18 @@ def render_demo_debug_video(
                 right_wrist = _read_rgb(caps["right_wrist"], camera_name="right_wrist", frame_idx=frame_idx)
 
                 segment_idx = _segment_index_for_frame(segments, frame_idx)
-                segment = segments[segment_idx]
-                segment_id = tuple(segment["frame_duration"])
+                segment = segments[segment_idx] if segment_idx is not None else None
+                segment_id = tuple(segment["frame_duration"]) if segment is not None else None
                 if segment_id != last_segment_id:
                     last_segment_id = segment_id
 
-                mapped_subtask = mapped_subtasks[segment_idx]
+                mapped_subtask = mapped_subtasks[segment_idx] if segment_idx is not None else None
                 prompt = _build_prompt(task_prompt, mapped_subtask, prompt_mode)
-                left_wrist, right_wrist, head = resize_debug_video_views(
+                left_wrist, right_wrist, head = _resize_views_for_mode(
                     left_wrist_rgb=left_wrist,
                     right_wrist_rgb=right_wrist,
                     head_rgb=head,
+                    high_resolution=high_resolution,
                 )
                 frame = build_debug_video_frame(
                     left_wrist_rgb=left_wrist,
@@ -313,9 +370,25 @@ def render_demo_debug_video(
                     ],
                     context_label="primitive/skill (from demo)",
                     context_value=None,
-                    context_lines=_format_demo_segment_lines(segment, selected_annotation_source),
+                    context_lines=(
+                        _format_demo_segment_lines(segment, selected_annotation_source)
+                        if segment is not None
+                        else []
+                    ),
                     mapped_subtask=mapped_subtask,
-                    prompt=prompt,
+                    prompt=prompt if include_prompt else None,
+                    text_height=text_height,
+                    include_prompt=include_prompt,
+                    compact_header=(
+                        f"task-{task_index:04d}: {task_name} | episode: {episode_id:08d} | timestep/frame: {frame_idx}"
+                        if overlay_mode == "compact_subtask"
+                        else None
+                    ),
+                    compact_subtask=(
+                        f"subtask: {_display_subtask(mapped_subtask)}"
+                        if overlay_mode == "compact_subtask"
+                        else None
+                    ),
                 )
                 _write_frame(container, stream, frame)
                 written += 1
@@ -326,7 +399,7 @@ def render_demo_debug_video(
             json.dumps(
                 {
                     "output_path": str(output_path),
-                    "resolution_hw": DEBUG_VIDEO_RESOLUTION,
+                    "resolution_hw": [output_height, output_width],
                     "source_frame_counts": frame_counts,
                     "written_frames": written,
                     "requested_annotation_source": annotation_source,
@@ -335,6 +408,11 @@ def render_demo_debug_video(
                     "output_fps": output_fps,
                     "prompt_mode": prompt_mode,
                     "macro_subtasks": macro_subtasks,
+                    "high_resolution": high_resolution,
+                    "lossless": lossless,
+                    "include_prompt": include_prompt,
+                    "overlay_mode": overlay_mode,
+                    "target_bitrate": target_bitrate,
                 },
                 sort_keys=True,
             )
@@ -366,6 +444,11 @@ def main() -> None:
     parser.add_argument("--mapping-path", type=pathlib.Path, default=None)
     parser.add_argument("--prompt-mode", choices=("long_task_subtask", "subtask_only"), default="long_task_subtask")
     parser.add_argument("--macro-subtasks", action="store_true")
+    parser.add_argument("--high-resolution", action="store_true")
+    parser.add_argument("--lossless", action="store_true")
+    parser.add_argument("--hide-prompt", action="store_true")
+    parser.add_argument("--overlay-mode", choices=("debug", "compact_subtask"), default="debug")
+    parser.add_argument("--target-bitrate", type=int, default=None)
     args = parser.parse_args()
     if args.stride < 1:
         raise ValueError("--stride must be >= 1")
@@ -384,6 +467,11 @@ def main() -> None:
         mapping_path=args.mapping_path.expanduser() if args.mapping_path is not None else None,
         prompt_mode=args.prompt_mode,
         macro_subtasks=args.macro_subtasks,
+        high_resolution=args.high_resolution,
+        lossless=args.lossless,
+        include_prompt=not args.hide_prompt,
+        overlay_mode=args.overlay_mode,
+        target_bitrate=args.target_bitrate,
     )
 
 

@@ -132,7 +132,7 @@ def _write_index(
         "</head>",
         "<body>",
         "<h1>BEHAVIOR Demo Subtask Debug Videos</h1>",
-        f"<p>{len(records)} rendered records, grouped by task. Each video is preceded by the exact segment-order demo annotation, mapped subtask, and adjacent-only macro subtask used by macro debug overlays.</p>",
+        f"<p>{len(records)} rendered records, grouped by task. Each video is preceded by the exact segment-order demo annotation and mapped subtask.</p>",
     ]
     for task_dir in sorted(videos_by_task):
         task_records = sorted(videos_by_task[task_dir], key=lambda item: item["episode"])
@@ -153,21 +153,25 @@ def _write_index(
                     '<div class="card">',
                     f'<div class="meta">{html.escape(record["episode"])}</div>',
                     '<table class="subtasks">',
-                    "<tr><th>#</th><th>frames</th><th>demo annotation</th><th>mapped subtask</th><th>macro subtask</th></tr>",
+                    "<tr><th>#</th><th>frames</th><th>demo annotation</th><th>mapped subtask</th>"
+                    + ("<th>macro subtask</th>" if macro_subtasks else "")
+                    + "</tr>",
                 ]
             )
             for row in rows:
                 mapped_cls = "missing" if row["mapped"].startswith("[") else ""
                 macro_cls = "missing" if row["macro"].startswith("[") else ""
-                lines.append(
+                row_html = (
                     "<tr>"
                     f"<td>{html.escape(row['idx'])}</td>"
                     f"<td>{html.escape(row['frames'])}</td>"
                     f"<td class=\"demo\">{html.escape(row['demo'])}</td>"
                     f"<td class=\"{mapped_cls}\">{html.escape(row['mapped'])}</td>"
-                    f"<td class=\"{macro_cls}\">{html.escape(row['macro'])}</td>"
-                    "</tr>"
                 )
+                if macro_subtasks:
+                    row_html += f"<td class=\"{macro_cls}\">{html.escape(row['macro'])}</td>"
+                row_html += "</tr>"
+                lines.append(row_html)
             lines.extend(
                 [
                     "</table>",
@@ -199,6 +203,12 @@ def main() -> None:
     parser.add_argument("--mapping-path", type=pathlib.Path, default=None)
     parser.add_argument("--prompt-mode", choices=("long_task_subtask", "subtask_only"), default="long_task_subtask")
     parser.add_argument("--macro-subtasks", action="store_true")
+    parser.add_argument("--task-indices", default=None, help="Comma-separated task indices to render, e.g. 0,1.")
+    parser.add_argument("--high-resolution", action="store_true")
+    parser.add_argument("--lossless", action="store_true")
+    parser.add_argument("--hide-prompt", action="store_true")
+    parser.add_argument("--overlay-mode", choices=("debug", "compact_subtask"), default="debug")
+    parser.add_argument("--target-mb", type=float, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -223,10 +233,18 @@ def main() -> None:
                     rendered_ok.add(record.get("output_path"))
                     existing_records_by_output[record.get("output_path")] = record
 
+    selected_task_indices = None
+    if args.task_indices:
+        selected_task_indices = {
+            int(item.strip().removeprefix("task-")) for item in args.task_indices.split(",") if item.strip()
+        }
+
     annotation_tasks = sorted((dataset_root / "annotations").glob("task-*"))
     jobs = []
     for task_dir in annotation_tasks:
         task_index = int(task_dir.name.removeprefix("task-"))
+        if selected_task_indices is not None and task_index not in selected_task_indices:
+            continue
         for annotation_path in sorted(task_dir.glob("episode_*.json"))[: args.episodes_per_task]:
             jobs.append((task_index, task_dir.name, annotation_path))
 
@@ -256,6 +274,11 @@ def main() -> None:
             }
             try:
                 task_name = _task_name_from_annotation(annotation_path)
+                target_bitrate = None
+                if args.target_mb is not None:
+                    source_frames = _source_frame_count(dataset_root, task_dir_name, episode_stem)
+                    source_duration = source_frames / args.output_fps
+                    target_bitrate = int(args.target_mb * 1024 * 1024 * 8 / source_duration * 0.94)
                 render_demo_debug_video(
                     dataset_root=dataset_root,
                     output_path=output_path,
@@ -269,6 +292,11 @@ def main() -> None:
                     mapping_path=args.mapping_path.expanduser() if args.mapping_path is not None else None,
                     prompt_mode=args.prompt_mode,
                     macro_subtasks=args.macro_subtasks,
+                    high_resolution=args.high_resolution,
+                    lossless=args.lossless,
+                    include_prompt=not args.hide_prompt,
+                    overlay_mode=args.overlay_mode,
+                    target_bitrate=target_bitrate,
                 )
                 successes += 1
                 ok_record = {**record, "task_name": task_name, "status": "ok"}

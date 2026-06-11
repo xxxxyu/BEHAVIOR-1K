@@ -1,3 +1,5 @@
+import os
+
 import torch as th
 from omnigibson.object_states import (
     ToggledOn,
@@ -142,6 +144,24 @@ def _check_state_spec(env, spec):
     raise ValueError(f"Invalid state spec: {spec}")
 
 
+def _check_grasping_spec(env, spec):
+    robot, obj = _resolve_object(env, spec[1]), _resolve_object(env, spec[2])
+    return (
+        robot.exists
+        and obj.exists
+        and robot.unwrapped.states[IsGrasping].get_value(obj.unwrapped) == spec[3]
+    )
+
+
+def _check_composite_spec(env, spec):
+    check_type = spec[0]
+    if check_type == "state":
+        return _check_state_spec(env, spec)
+    if check_type == "grasping":
+        return _check_grasping_spec(env, spec)
+    raise ValueError(f"Invalid composite progress spec: {spec}")
+
+
 def check_progress(env, check_specs):
     """Generic progress checker using declarative specs."""
     results = {}
@@ -149,36 +169,78 @@ def check_progress(env, check_specs):
     for name, spec in check_specs.items():
         check_type = spec[0]
 
-        if check_type == "near":
-            # ("near", robot_key, obj_key) - robot should always be first
+        if check_type in {"near", "near_threshold", "near_base_threshold", "near_category_threshold"}:
+            # ("near", robot_key, obj_key) - robot should always be first.
+            # ("near_threshold", robot_key, obj_key, threshold) allows task-local stricter navigation gates.
+            # ("near_base_threshold", robot_key, obj_key, threshold) ignores arms/eef for navigation gates.
+            # ("near_category_threshold", robot_key, category_key, threshold) accepts any category instance.
             robot_entity = _resolve_object(env, spec[1])
-            obj_entity = _resolve_object(env, spec[2])
-            if not (robot_entity.exists and obj_entity.exists):
+            obj_entities = (
+                _resolve_category_objects(env, spec[2])
+                if check_type == "near_category_threshold"
+                else [_resolve_object(env, spec[2])]
+            )
+            obj_entities = [obj_entity for obj_entity in obj_entities if obj_entity.exists]
+            if not (robot_entity.exists and obj_entities):
                 results[name] = False
                 continue
-            robot, obj = robot_entity.unwrapped, obj_entity.unwrapped
+            robot = robot_entity.unwrapped
+            threshold = (
+                spec[3]
+                if check_type in {"near_threshold", "near_base_threshold", "near_category_threshold"}
+                else ROBOT_OBJECT_DISTANCE_THRESHOLD
+            )
 
             # Get all robot links to check: root_link and all eef_links
-            robot_links_to_check = [robot.root_link] + list(robot.eef_links.values())
+            robot_links_to_check = (
+                [robot.root_link]
+                if check_type == "near_base_threshold"
+                else [robot.root_link] + list(robot.eef_links.values())
+            )
 
             # Get all object links
-            obj_links = list(obj.links.values())
+            candidate_obj_links = []
+            for obj_entity in obj_entities:
+                obj = obj_entity.unwrapped
+                candidate_obj_links.extend((getattr(obj, "name", ""), obj_link) for obj_link in obj.links.values())
 
             # Check minimum distance between any robot link and any object link
+            debug_near = bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR"))
             is_near = False
+            root_min_dist = None
+            eef_min_dist = None
+            all_min_dist = None
+            nearest_obj_name = None
             for robot_link in robot_links_to_check:
                 robot_pos = robot_link.get_position_orientation()[0]
-                for obj_link in obj_links:
+                for obj_name, obj_link in candidate_obj_links:
                     obj_pos = obj_link.get_position_orientation()[0]
                     # Only consider x and y coordinates (horizontal distance)
                     dist = th.linalg.norm(robot_pos[:2] - obj_pos[:2])
-                    if dist < ROBOT_OBJECT_DISTANCE_THRESHOLD:
+                    dist_float = float(dist.item())
+                    if all_min_dist is None or dist_float < all_min_dist:
+                        nearest_obj_name = obj_name
+                    if robot_link is robot.root_link:
+                        root_min_dist = dist_float if root_min_dist is None else min(root_min_dist, dist_float)
+                    else:
+                        eef_min_dist = dist_float if eef_min_dist is None else min(eef_min_dist, dist_float)
+                    all_min_dist = dist_float if all_min_dist is None else min(all_min_dist, dist_float)
+                    if dist < threshold:
                         is_near = True
-                        break
-                if is_near:
+                        if not debug_near:
+                            break
+                if is_near and not debug_near:
                     break
 
             results[name] = is_near
+            if debug_near:
+                print(
+                    "[task_progress_debug_near] "
+                    f"name={name} check_type={check_type} threshold={threshold} result={is_near} "
+                    f"root_min={root_min_dist} eef_min={eef_min_dist} all_min={all_min_dist} "
+                    f"nearest_obj={nearest_obj_name}",
+                    flush=True,
+                )
 
         elif check_type == "state":
             # Check if it's a relational or non-relational state based on argument pattern
@@ -186,16 +248,15 @@ def check_progress(env, check_specs):
 
         elif check_type == "any_state":
             # ("any_state", [state_spec, ...]) - useful for BDDL goals with OR branches.
-            results[name] = any(_check_state_spec(env, state_spec) for state_spec in spec[1])
+            results[name] = any(_check_composite_spec(env, state_spec) for state_spec in spec[1])
+
+        elif check_type == "all_state":
+            # ("all_state", [state_spec, ...]) - useful for grouped progress stages.
+            results[name] = all(_check_composite_spec(env, state_spec) for state_spec in spec[1])
 
         elif check_type == "grasping":
             # ("grasping", robot_key, obj_key, expected_bool) - robot is grasping object
-            robot, obj = _resolve_object(env, spec[1]), _resolve_object(env, spec[2])
-            results[name] = (
-                robot.exists
-                and obj.exists
-                and robot.unwrapped.states[IsGrasping].get_value(obj.unwrapped) == spec[3]
-            )
+            results[name] = _check_grasping_spec(env, spec)
 
         elif check_type == "open_fraction":
             # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
@@ -344,18 +405,70 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_basket": ("near", "agent.n.01_1", "wicker_basket.n.01_1"),
-            "robot_near_tree": ("near", "agent.n.01_1", "tree.n.01_1"),
+            "robot_near_tree": ("near_category_threshold", "agent.n.01_1", "tree.n.01", 1.2),
             "basket_picked_up": ("state", "wicker_basket.n.01_1", OnTop, "lawn.n.01_1", False),
-            "basket_next_to_tree": ("state", "wicker_basket.n.01_1", NextTo, "tree.n.01", True),
-            "egg_1_out_of_basket": ("state", "easter_egg.n.01_1", Inside, "wicker_basket.n.01_1", False),
-            "egg_2_out_of_basket": ("state", "easter_egg.n.01_2", Inside, "wicker_basket.n.01_1", False),
-            "egg_3_out_of_basket": ("state", "easter_egg.n.01_3", Inside, "wicker_basket.n.01_1", False),
-            "egg_1_on_lawn": ("state", "easter_egg.n.01_1", OnTop, "lawn.n.01_1", True),
-            "egg_2_on_lawn": ("state", "easter_egg.n.01_2", OnTop, "lawn.n.01_1", True),
-            "egg_3_on_lawn": ("state", "easter_egg.n.01_3", OnTop, "lawn.n.01_1", True),
-            "egg_1_next_to_tree": ("state", "easter_egg.n.01_1", NextTo, "tree.n.01", True),
-            "egg_2_next_to_tree": ("state", "easter_egg.n.01_2", NextTo, "tree.n.01", True),
-            "egg_3_next_to_tree": ("state", "easter_egg.n.01_3", NextTo, "tree.n.01", True),
+            "basket_next_to_tree": (
+                "all_state",
+                [
+                    ("state", "wicker_basket.n.01_1", NextTo, "tree.n.01", True),
+                    ("state", "wicker_basket.n.01_1", OnTop, "lawn.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "wicker_basket.n.01_1", False),
+                ],
+            ),
+            "egg_1_out_of_basket": ("grasping", "agent.n.01_1", "easter_egg.n.01_1", True),
+            "egg_2_out_of_basket": ("grasping", "agent.n.01_1", "easter_egg.n.01_2", True),
+            "egg_3_out_of_basket": ("grasping", "agent.n.01_1", "easter_egg.n.01_3", True),
+            "egg_1_on_lawn": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_1", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_1", OnTop, "lawn.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_1", False),
+                ],
+            ),
+            "egg_2_on_lawn": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_2", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_2", OnTop, "lawn.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_2", False),
+                ],
+            ),
+            "egg_3_on_lawn": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_3", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_3", OnTop, "lawn.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_3", False),
+                ],
+            ),
+            "egg_1_next_to_tree": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_1", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_1", OnTop, "lawn.n.01_1", True),
+                    ("state", "easter_egg.n.01_1", NextTo, "tree.n.01", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_1", False),
+                ],
+            ),
+            "egg_2_next_to_tree": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_2", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_2", OnTop, "lawn.n.01_1", True),
+                    ("state", "easter_egg.n.01_2", NextTo, "tree.n.01", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_2", False),
+                ],
+            ),
+            "egg_3_next_to_tree": (
+                "all_state",
+                [
+                    ("state", "easter_egg.n.01_3", Inside, "wicker_basket.n.01_1", False),
+                    ("state", "easter_egg.n.01_3", OnTop, "lawn.n.01_1", True),
+                    ("state", "easter_egg.n.01_3", NextTo, "tree.n.01", True),
+                    ("grasping", "agent.n.01_1", "easter_egg.n.01_3", False),
+                ],
+            ),
         },
     ),
     "picking_up_toys": lambda env: check_progress(
@@ -423,12 +536,18 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_countertop": ("near", "agent.n.01_1", "countertop.n.01_1"),
+            "robot_near_coffee_cup": ("near", "agent.n.01_1", "coffee_cup.n.01_1"),
+            "robot_near_saucer": ("near", "agent.n.01_1", "saucer.n.02_1"),
+            "robot_near_electric_kettle": ("near", "agent.n.01_1", "electric_kettle.n.01_1"),
+            "robot_near_paper_coffee_filter": ("near", "agent.n.01_1", "paper_coffee_filter.n.01_1"),
+            "robot_near_bottle_of_coffee": ("near", "agent.n.01_1", "bottle__of__coffee.n.01_1"),
             "robot_near_shelf": ("near", "agent.n.01_1", "shelf.n.01_1"),
             "robot_near_coffee_maker": ("near", "agent.n.01_1", "coffee_maker.n.01_1"),
             "filter_picked_up": ("state", "paper_coffee_filter.n.01_1", OnTop, "countertop.n.01_1", False),
             "filter_in_coffee_maker": ("state", "paper_coffee_filter.n.01_1", OnTop, "coffee_maker.n.01_1", True),
             "coffee_bottle_picked_up": ("state", "bottle__of__coffee.n.01_1", OnTop, "shelf.n.01_1", False),
             "coffee_bottle_near_maker": ("state", "bottle__of__coffee.n.01_1", NextTo, "coffee_maker.n.01_1", True),
+            "kettle_picked_up": ("state", "electric_kettle.n.01_1", OnTop, "countertop.n.01_1", False),
             "kettle_repositioned": ("state", "electric_kettle.n.01_1", NextTo, "coffee_maker.n.01_1", True),
             "saucer_near_maker": ("state", "saucer.n.02_1", NextTo, "coffee_maker.n.01_1", True),
             "cup_picked_up": ("state", "coffee_cup.n.01_1", OnTop, "countertop.n.01_1", False),
@@ -652,15 +771,93 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_gym_shoe_2": ("near", "agent.n.01_1", "gym_shoe.n.01_2"),
             "robot_near_sandal_1": ("near", "agent.n.01_1", "sandal.n.01_1"),
             "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
-            "robot_near_hallstand": ("near", "agent.n.01_1", "hallstand.n.01_1"),
-            "gym_shoe_1_picked_up": ("state", "gym_shoe.n.01_1", OnTop, "floor.n.01_1", False),
-            "gym_shoe_2_picked_up": ("state", "gym_shoe.n.01_2", OnTop, "floor.n.01_1", False),
-            "sandal_1_picked_up": ("state", "sandal.n.01_1", OnTop, "floor.n.01_1", False),
-            "sandal_2_picked_up": ("state", "sandal.n.01_2", OnTop, "floor.n.01_1", False),
-            "gym_shoe_1_on_rack": ("state", "gym_shoe.n.01_1", Touching, "hallstand.n.01_1", True),
-            "gym_shoe_2_on_rack": ("state", "gym_shoe.n.01_2", Touching, "hallstand.n.01_1", True),
-            "sandal_1_on_rack": ("state", "sandal.n.01_1", Touching, "hallstand.n.01_1", True),
-            "sandal_2_on_rack": ("state", "sandal.n.01_2", Touching, "hallstand.n.01_1", True),
+            "robot_near_hallstand": ("near_threshold", "agent.n.01_1", "hallstand.n.01_1", 0.8),
+            "gym_shoe_1_picked_up": ("grasping", "agent.n.01_1", "gym_shoe.n.01_1", True),
+            "gym_shoe_2_picked_up": ("grasping", "agent.n.01_1", "gym_shoe.n.01_2", True),
+            "sandal_1_picked_up": ("grasping", "agent.n.01_1", "sandal.n.01_1", True),
+            "sandal_2_picked_up": ("grasping", "agent.n.01_1", "sandal.n.01_2", True),
+            "gym_shoe_1_on_floor": (
+                "all_state",
+                [
+                    ("state", "gym_shoe.n.01_1", OnTop, "floor.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_1", False),
+                ],
+            ),
+            "gym_shoe_2_on_floor": (
+                "all_state",
+                [
+                    ("state", "gym_shoe.n.01_2", OnTop, "floor.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_2", False),
+                ],
+            ),
+            "sandal_1_on_floor": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_1", OnTop, "floor.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_1", False),
+                ],
+            ),
+            "sandal_2_on_floor": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_2", OnTop, "floor.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_2", False),
+                ],
+            ),
+            "gym_shoe_1_on_rack": (
+                "all_state",
+                [
+                    ("state", "gym_shoe.n.01_1", Touching, "hallstand.n.01_1", True),
+                    ("state", "gym_shoe.n.01_1", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_1", False),
+                ],
+            ),
+            "gym_shoe_2_on_rack": (
+                "all_state",
+                [
+                    ("state", "gym_shoe.n.01_2", Touching, "hallstand.n.01_1", True),
+                    ("state", "gym_shoe.n.01_2", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_2", False),
+                ],
+            ),
+            "sandal_1_on_rack": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_1", Touching, "hallstand.n.01_1", True),
+                    ("state", "sandal.n.01_1", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_1", False),
+                ],
+            ),
+            "sandal_2_on_rack": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_2", Touching, "hallstand.n.01_1", True),
+                    ("state", "sandal.n.01_2", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_2", False),
+                ],
+            ),
+            "gym_shoes_on_rack": (
+                "all_state",
+                [
+                    ("state", "gym_shoe.n.01_1", Touching, "hallstand.n.01_1", True),
+                    ("state", "gym_shoe.n.01_1", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_1", False),
+                    ("state", "gym_shoe.n.01_2", Touching, "hallstand.n.01_1", True),
+                    ("state", "gym_shoe.n.01_2", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "gym_shoe.n.01_2", False),
+                ],
+            ),
+            "sandals_on_rack": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_1", Touching, "hallstand.n.01_1", True),
+                    ("state", "sandal.n.01_1", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_1", False),
+                    ("state", "sandal.n.01_2", Touching, "hallstand.n.01_1", True),
+                    ("state", "sandal.n.01_2", Touching, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_2", False),
+                ],
+            ),
             "gym_shoes_paired": ("state", "gym_shoe.n.01_1", NextTo, "gym_shoe.n.01_2", True),
             "sandals_paired": ("state", "sandal.n.01_1", NextTo, "sandal.n.01_2", True),
         },
