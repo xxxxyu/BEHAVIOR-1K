@@ -23,6 +23,42 @@ ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
 PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
 
 
+def _near_profile():
+    return os.environ.get("BEHAVIOR_TASK_PROGRESS_NEAR_PROFILE", "current").strip().lower()
+
+
+def _near_mode_and_thresholds(check_type, spec):
+    if check_type == "near_base_threshold":
+        return "base", float(spec[3]), None
+    if check_type in {"near_threshold", "near_category_threshold"}:
+        return "any", float(spec[3]), None
+
+    profile = _near_profile()
+    if profile in {"", "current", "any_0.5", "any050"}:
+        return "any", ROBOT_OBJECT_DISTANCE_THRESHOLD, None
+    if profile in {"base_0.35", "base035"}:
+        return "base", 0.35, None
+    if profile in {"base_0.45", "base045"}:
+        return "base", 0.45, None
+    if profile in {"base_0.55", "base055"}:
+        return "base", 0.55, None
+    if profile in {"eef_0.30", "eef030"}:
+        return "eef", 0.30, None
+    if profile in {"eef_0.40", "eef040"}:
+        return "eef", 0.40, None
+    if profile in {"base045_or_eef035", "base_0.45_or_eef_0.35"}:
+        return "base_or_eef", 0.45, 0.35
+    if profile == "demo_calibrated":
+        base_threshold = float(os.environ.get("BEHAVIOR_TASK_PROGRESS_NEAR_DEMO_BASE_THRESHOLD", "0.45"))
+        eef_threshold = float(os.environ.get("BEHAVIOR_TASK_PROGRESS_NEAR_DEMO_EEF_THRESHOLD", "0.35"))
+        return "base_or_eef", base_threshold, eef_threshold
+    raise ValueError(
+        "Unknown BEHAVIOR_TASK_PROGRESS_NEAR_PROFILE="
+        f"{profile!r}. Expected current, base_0.35, base_0.45, base_0.55, "
+        "eef_0.30, eef_0.40, base045_or_eef035, or demo_calibrated."
+    )
+
+
 class _ProgressObject:
     """Thin adapter for scene objects that are not present in task.object_scope."""
 
@@ -185,16 +221,14 @@ def check_progress(env, check_specs):
                 results[name] = False
                 continue
             robot = robot_entity.unwrapped
-            threshold = (
-                spec[3]
-                if check_type in {"near_threshold", "near_base_threshold", "near_category_threshold"}
-                else ROBOT_OBJECT_DISTANCE_THRESHOLD
-            )
+            near_mode, threshold, eef_threshold = _near_mode_and_thresholds(check_type, spec)
 
             # Get all robot links to check: root_link and all eef_links
             robot_links_to_check = (
                 [robot.root_link]
-                if check_type == "near_base_threshold"
+                if near_mode == "base"
+                else list(robot.eef_links.values())
+                if near_mode == "eef"
                 else [robot.root_link] + list(robot.eef_links.values())
             )
 
@@ -225,7 +259,11 @@ def check_progress(env, check_specs):
                     else:
                         eef_min_dist = dist_float if eef_min_dist is None else min(eef_min_dist, dist_float)
                     all_min_dist = dist_float if all_min_dist is None else min(all_min_dist, dist_float)
-                    if dist < threshold:
+                    if near_mode == "base_or_eef":
+                        link_threshold = threshold if robot_link is robot.root_link else eef_threshold
+                    else:
+                        link_threshold = threshold
+                    if link_threshold is not None and dist < link_threshold:
                         is_near = True
                         if not debug_near:
                             break
@@ -236,7 +274,8 @@ def check_progress(env, check_specs):
             if debug_near:
                 print(
                     "[task_progress_debug_near] "
-                    f"name={name} check_type={check_type} threshold={threshold} result={is_near} "
+                    f"name={name} check_type={check_type} profile={_near_profile()} mode={near_mode} "
+                    f"threshold={threshold} eef_threshold={eef_threshold} result={is_near} "
                     f"root_min={root_min_dist} eef_min={eef_min_dist} all_min={all_min_dist} "
                     f"nearest_obj={nearest_obj_name}",
                     flush=True,
