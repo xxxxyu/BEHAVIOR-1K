@@ -42,6 +42,8 @@ def _near_mode_and_thresholds(check_type, spec):
         return "base", 0.45, None
     if profile in {"base_0.55", "base055"}:
         return "base", 0.55, None
+    if profile in {"eef_0.10", "eef010"}:
+        return "eef", 0.10, None
     if profile in {"eef_0.20", "eef020"}:
         return "eef", 0.20, None
     if profile in {"eef_0.30", "eef030"}:
@@ -52,6 +54,8 @@ def _near_mode_and_thresholds(check_type, spec):
         return "eef", 0.35, None
     if profile in {"eef_0.40", "eef040"}:
         return "eef", 0.40, None
+    if profile in {"eef_0.50", "eef050"}:
+        return "eef", 0.50, None
     if profile in {"base045_or_eef030", "base_0.45_or_eef_0.30"}:
         return "base_or_eef", 0.45, 0.30
     if profile in {"base045_or_eef035", "base_0.45_or_eef_0.35"}:
@@ -63,7 +67,7 @@ def _near_mode_and_thresholds(check_type, spec):
     raise ValueError(
         "Unknown BEHAVIOR_TASK_PROGRESS_NEAR_PROFILE="
         f"{profile!r}. Expected current, base_0.35, base_0.45, base_0.55, "
-        "eef_0.20, eef_0.25, eef_0.30, eef_0.35, eef_0.40, "
+        "eef_0.10, eef_0.20, eef_0.25, eef_0.30, eef_0.35, eef_0.40, eef_0.50, "
         "base045_or_eef030, base045_or_eef035, or demo_calibrated."
     )
 
