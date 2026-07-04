@@ -90,6 +90,15 @@ def _robot_base_link(robot):
     return robot.base_footprint_link
 
 
+def _object_room_names(obj_entity):
+    rooms = getattr(obj_entity.unwrapped, "in_rooms", None)
+    if rooms is None:
+        return set()
+    if isinstance(rooms, str):
+        return {rooms}
+    return set(rooms)
+
+
 class _ProgressObject:
     """Thin adapter for scene objects that are not present in task.object_scope."""
 
@@ -347,6 +356,33 @@ def check_progress(env, check_specs):
         elif check_type == "state":
             # Check if it's a relational or non-relational state based on argument pattern
             results[name] = _check_state_spec(env, spec)
+
+        elif check_type == "robot_in_room_of":
+            # ("robot_in_room_of", robot_key, obj_key) checks whether the robot base
+            # is in one of the room instances assigned to the target scene object.
+            robot_entity = _resolve_object(env, spec[1])
+            obj_entity = _resolve_object(env, spec[2])
+            scene = getattr(env, "scene", None)
+            seg_map = getattr(scene, "seg_map", None) if scene is not None else None
+            target_rooms = _object_room_names(obj_entity)
+            if not (robot_entity.exists and obj_entity.exists and seg_map is not None and target_rooms):
+                results[name] = False
+                continue
+
+            robot = robot_entity.unwrapped
+            robot_xy = _robot_base_link(robot).get_position_orientation()[0][:2]
+            room_instance = seg_map.get_room_instance_by_point(robot_xy)
+            room_type = seg_map.get_room_type_by_point(robot_xy)
+            target_room_types = {room.rsplit("_", 1)[0] for room in target_rooms}
+            results[name] = room_instance in target_rooms or room_type in target_room_types
+            if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR")):
+                print(
+                    "[task_progress_debug_room] "
+                    f"name={name} check_type={check_type} result={results[name]} "
+                    f"robot_room_instance={room_instance} robot_room_type={room_type} "
+                    f"target_rooms={sorted(target_rooms)} target_room_types={sorted(target_room_types)}",
+                    flush=True,
+                )
 
         elif check_type == "any_state":
             # ("any_state", [state_spec, ...]) - useful for BDDL goals with OR branches.
@@ -769,7 +805,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
             "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
-            "robot_near_garage_floor": ("near", "agent.n.01_1", "floor.n.01_2"),
+            "robot_near_garage_floor": ("robot_in_room_of", "agent.n.01_1", "floor.n.01_2"),
             "container_1_picked_up": ("state", "storage_container.n.01_1", OnTop, "floor.n.01_1", False),
             "container_2_picked_up": ("state", "storage_container.n.01_2", OnTop, "floor.n.01_1", False),
             "container_1_in_garage": ("state", "storage_container.n.01_1", OnTop, "floor.n.01_2", True),
