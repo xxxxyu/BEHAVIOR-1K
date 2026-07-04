@@ -37,6 +37,10 @@ def _moving_boxes_door_threshold():
     )
 
 
+def _debug_task_progress_open():
+    return bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_OPEN"))
+
+
 def _near_mode_and_thresholds(check_type, spec):
     if check_type == "near_base_threshold":
         return "base", float(spec[3]), None
@@ -254,33 +258,45 @@ def check_progress(env, check_specs):
                 if near_mode == "eef"
                 else [robot.root_link] + list(robot.eef_links.values())
             )
+            debug_near = bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR"))
+            diagnostic_robot_links = [robot.root_link] + list(robot.eef_links.values()) if debug_near else robot_links_to_check
 
             # Get all object links
             candidate_obj_links = []
             for obj_entity in obj_entities:
                 obj = obj_entity.unwrapped
-                candidate_obj_links.extend((getattr(obj, "name", ""), obj_link) for obj_link in obj.links.values())
+                candidate_obj_links.extend((getattr(obj, "name", ""), obj_link_name, obj_link) for obj_link_name, obj_link in obj.links.items())
 
             # Check minimum distance between any robot link and any object link
-            debug_near = bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR"))
             is_near = False
             root_min_dist = None
             eef_min_dist = None
             all_min_dist = None
             nearest_obj_name = None
+            nearest_obj_link_name = None
+            nearest_robot_link_name = None
+            root_nearest_obj_link_name = None
+            eef_nearest_obj_link_name = None
             for robot_link in robot_links_to_check:
                 robot_pos = robot_link.get_position_orientation()[0]
-                for obj_name, obj_link in candidate_obj_links:
+                robot_link_name = "root" if robot_link is robot.root_link else getattr(robot_link, "name", "eef")
+                for obj_name, obj_link_name, obj_link in candidate_obj_links:
                     obj_pos = obj_link.get_position_orientation()[0]
                     # Only consider x and y coordinates (horizontal distance)
                     dist = th.linalg.norm(robot_pos[:2] - obj_pos[:2])
                     dist_float = float(dist.item())
                     if all_min_dist is None or dist_float < all_min_dist:
                         nearest_obj_name = obj_name
+                        nearest_obj_link_name = obj_link_name
+                        nearest_robot_link_name = robot_link_name
                     if robot_link is robot.root_link:
-                        root_min_dist = dist_float if root_min_dist is None else min(root_min_dist, dist_float)
+                        if root_min_dist is None or dist_float < root_min_dist:
+                            root_min_dist = dist_float
+                            root_nearest_obj_link_name = obj_link_name
                     else:
-                        eef_min_dist = dist_float if eef_min_dist is None else min(eef_min_dist, dist_float)
+                        if eef_min_dist is None or dist_float < eef_min_dist:
+                            eef_min_dist = dist_float
+                            eef_nearest_obj_link_name = obj_link_name
                     all_min_dist = dist_float if all_min_dist is None else min(all_min_dist, dist_float)
                     if near_mode == "base_or_eef":
                         link_threshold = threshold if robot_link is robot.root_link else eef_threshold
@@ -293,6 +309,23 @@ def check_progress(env, check_specs):
                 if is_near and not debug_near:
                     break
 
+            if debug_near and near_mode == "base":
+                for robot_link in diagnostic_robot_links:
+                    if robot_link is robot.root_link:
+                        continue
+                    robot_pos = robot_link.get_position_orientation()[0]
+                    for obj_name, obj_link_name, obj_link in candidate_obj_links:
+                        obj_pos = obj_link.get_position_orientation()[0]
+                        dist_float = float(th.linalg.norm(robot_pos[:2] - obj_pos[:2]).item())
+                        if all_min_dist is None or dist_float < all_min_dist:
+                            all_min_dist = dist_float
+                            nearest_obj_name = obj_name
+                            nearest_obj_link_name = obj_link_name
+                            nearest_robot_link_name = getattr(robot_link, "name", "eef")
+                        if eef_min_dist is None or dist_float < eef_min_dist:
+                            eef_min_dist = dist_float
+                            eef_nearest_obj_link_name = obj_link_name
+
             results[name] = is_near
             if debug_near:
                 print(
@@ -300,7 +333,9 @@ def check_progress(env, check_specs):
                     f"name={name} check_type={check_type} profile={_near_profile()} mode={near_mode} "
                     f"threshold={threshold} eef_threshold={eef_threshold} result={is_near} "
                     f"root_min={root_min_dist} eef_min={eef_min_dist} all_min={all_min_dist} "
-                    f"nearest_obj={nearest_obj_name}",
+                    f"nearest_robot_link={nearest_robot_link_name} nearest_obj={nearest_obj_name} "
+                    f"nearest_obj_link={nearest_obj_link_name} root_nearest_obj_link={root_nearest_obj_link_name} "
+                    f"eef_nearest_obj_link={eef_nearest_obj_link_name}",
                     flush=True,
                 )
 
@@ -323,10 +358,18 @@ def check_progress(env, check_specs):
         elif check_type == "open_fraction":
             # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
             obj = _resolve_object(env, spec[1])
+            fraction = _object_open_fraction(obj) if obj.exists else None
             results[name] = (
                 obj.exists
-                and (_object_open_fraction(obj) >= spec[2]) == spec[3]
+                and (fraction >= spec[2]) == spec[3]
             )
+            if _debug_task_progress_open():
+                print(
+                    "[task_progress_debug_open] "
+                    f"name={name} obj={spec[1]} threshold={spec[2]} expected={spec[3]} "
+                    f"fraction={fraction} result={results[name]}",
+                    flush=True,
+                )
 
         elif check_type == "exists":
             # ("exists", obj_key, expected_bool) - check if object exists
