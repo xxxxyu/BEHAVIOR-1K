@@ -702,7 +702,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "moving_boxes_to_storage": lambda env: check_progress(
         env,
         {
-            "robot_near_door": ("near_base_threshold", "agent.n.01_1", "door_bexenl_0", 1.2),
+            "robot_near_door": ("near_base_threshold", "agent.n.01_1", "door_bexenl_0", 1.8),
             "door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
             "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
