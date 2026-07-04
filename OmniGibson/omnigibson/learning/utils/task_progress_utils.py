@@ -21,10 +21,20 @@ from omnigibson.object_states import (
 
 ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
 PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
+MOVING_BOXES_DOOR_DISTANCE_THRESHOLD = 1.2
 
 
 def _near_profile():
     return os.environ.get("BEHAVIOR_TASK_PROGRESS_NEAR_PROFILE", "current").strip().lower()
+
+
+def _moving_boxes_door_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_BOXES_DOOR_THRESHOLD",
+            str(MOVING_BOXES_DOOR_DISTANCE_THRESHOLD),
+        )
+    )
 
 
 def _near_mode_and_thresholds(check_type, spec):
@@ -702,7 +712,12 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "moving_boxes_to_storage": lambda env: check_progress(
         env,
         {
-            "robot_near_door": ("near_base_threshold", "agent.n.01_1", "door_bexenl_0", 1.8),
+            "robot_near_door": (
+                "near_base_threshold",
+                "agent.n.01_1",
+                "door_bexenl_0",
+                _moving_boxes_door_threshold(),
+            ),
             "door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
             "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
