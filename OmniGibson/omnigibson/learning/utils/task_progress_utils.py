@@ -86,6 +86,10 @@ def _near_mode_and_thresholds(check_type, spec):
     )
 
 
+def _robot_base_link(robot):
+    return robot.base_footprint_link
+
+
 class _ProgressObject:
     """Thin adapter for scene objects that are not present in task.object_scope."""
 
@@ -249,17 +253,18 @@ def check_progress(env, check_specs):
                 continue
             robot = robot_entity.unwrapped
             near_mode, threshold, eef_threshold = _near_mode_and_thresholds(check_type, spec)
+            robot_base_link = _robot_base_link(robot)
 
-            # Get all robot links to check: root_link and all eef_links
+            # Get all robot links to check: navigation base link and all eef_links
             robot_links_to_check = (
-                [robot.root_link]
+                [robot_base_link]
                 if near_mode == "base"
                 else list(robot.eef_links.values())
                 if near_mode == "eef"
-                else [robot.root_link] + list(robot.eef_links.values())
+                else [robot_base_link] + list(robot.eef_links.values())
             )
             debug_near = bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR"))
-            diagnostic_robot_links = [robot.root_link] + list(robot.eef_links.values()) if debug_near else robot_links_to_check
+            diagnostic_robot_links = [robot_base_link] + list(robot.eef_links.values()) if debug_near else robot_links_to_check
 
             # Get all object links
             candidate_obj_links = []
@@ -269,17 +274,17 @@ def check_progress(env, check_specs):
 
             # Check minimum distance between any robot link and any object link
             is_near = False
-            root_min_dist = None
+            base_min_dist = None
             eef_min_dist = None
             all_min_dist = None
             nearest_obj_name = None
             nearest_obj_link_name = None
             nearest_robot_link_name = None
-            root_nearest_obj_link_name = None
+            base_nearest_obj_link_name = None
             eef_nearest_obj_link_name = None
             for robot_link in robot_links_to_check:
                 robot_pos = robot_link.get_position_orientation()[0]
-                robot_link_name = "root" if robot_link is robot.root_link else getattr(robot_link, "name", "eef")
+                robot_link_name = "base" if robot_link is robot_base_link else getattr(robot_link, "name", "eef")
                 for obj_name, obj_link_name, obj_link in candidate_obj_links:
                     obj_pos = obj_link.get_position_orientation()[0]
                     # Only consider x and y coordinates (horizontal distance)
@@ -289,17 +294,17 @@ def check_progress(env, check_specs):
                         nearest_obj_name = obj_name
                         nearest_obj_link_name = obj_link_name
                         nearest_robot_link_name = robot_link_name
-                    if robot_link is robot.root_link:
-                        if root_min_dist is None or dist_float < root_min_dist:
-                            root_min_dist = dist_float
-                            root_nearest_obj_link_name = obj_link_name
+                    if robot_link is robot_base_link:
+                        if base_min_dist is None or dist_float < base_min_dist:
+                            base_min_dist = dist_float
+                            base_nearest_obj_link_name = obj_link_name
                     else:
                         if eef_min_dist is None or dist_float < eef_min_dist:
                             eef_min_dist = dist_float
                             eef_nearest_obj_link_name = obj_link_name
                     all_min_dist = dist_float if all_min_dist is None else min(all_min_dist, dist_float)
                     if near_mode == "base_or_eef":
-                        link_threshold = threshold if robot_link is robot.root_link else eef_threshold
+                        link_threshold = threshold if robot_link is robot_base_link else eef_threshold
                     else:
                         link_threshold = threshold
                     if link_threshold is not None and dist < link_threshold:
@@ -311,7 +316,7 @@ def check_progress(env, check_specs):
 
             if debug_near and near_mode == "base":
                 for robot_link in diagnostic_robot_links:
-                    if robot_link is robot.root_link:
+                    if robot_link is robot_base_link:
                         continue
                     robot_pos = robot_link.get_position_orientation()[0]
                     for obj_name, obj_link_name, obj_link in candidate_obj_links:
@@ -332,9 +337,9 @@ def check_progress(env, check_specs):
                     "[task_progress_debug_near] "
                     f"name={name} check_type={check_type} profile={_near_profile()} mode={near_mode} "
                     f"threshold={threshold} eef_threshold={eef_threshold} result={is_near} "
-                    f"root_min={root_min_dist} eef_min={eef_min_dist} all_min={all_min_dist} "
+                    f"base_min={base_min_dist} eef_min={eef_min_dist} all_min={all_min_dist} "
                     f"nearest_robot_link={nearest_robot_link_name} nearest_obj={nearest_obj_name} "
-                    f"nearest_obj_link={nearest_obj_link_name} root_nearest_obj_link={root_nearest_obj_link_name} "
+                    f"nearest_obj_link={nearest_obj_link_name} base_nearest_obj_link={base_nearest_obj_link_name} "
                     f"eef_nearest_obj_link={eef_nearest_obj_link_name}",
                     flush=True,
                 )
