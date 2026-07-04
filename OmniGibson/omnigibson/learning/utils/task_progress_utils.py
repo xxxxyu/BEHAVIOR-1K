@@ -372,15 +372,12 @@ def check_progress(env, check_specs):
             robot = robot_entity.unwrapped
             robot_xy = _robot_base_link(robot).get_position_orientation()[0][:2]
             room_instance = seg_map.get_room_instance_by_point(robot_xy)
-            room_type = seg_map.get_room_type_by_point(robot_xy)
-            target_room_types = {room.rsplit("_", 1)[0] for room in target_rooms}
-            results[name] = room_instance in target_rooms or room_type in target_room_types
+            results[name] = room_instance in target_rooms
             if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR")):
                 print(
                     "[task_progress_debug_room] "
                     f"name={name} check_type={check_type} result={results[name]} "
-                    f"robot_room_instance={room_instance} robot_room_type={room_type} "
-                    f"target_rooms={sorted(target_rooms)} target_room_types={sorted(target_room_types)}",
+                    f"robot_room_instance={room_instance} target_rooms={sorted(target_rooms)}",
                     flush=True,
                 )
 
