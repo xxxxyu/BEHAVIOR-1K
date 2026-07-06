@@ -481,6 +481,7 @@ class Evaluator:
             instance_id (int): The ID of the task instance to load.
             test_hidden (bool): [Interal use only] Whether to load the hidden test instance.
         """
+        self.env.task.activity_instance_id = int(instance_id)
         scene_model = self.env.task.scene_name
         tro_filename = self.env.task.get_cached_activity_scene_filename(
             scene_model=scene_model,

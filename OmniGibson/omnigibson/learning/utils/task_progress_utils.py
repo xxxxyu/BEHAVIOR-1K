@@ -30,6 +30,14 @@ def _near_profile():
     return os.environ.get("BEHAVIOR_TASK_PROGRESS_NEAR_PROFILE", "current").strip().lower()
 
 
+def _activity_instance_id(env):
+    task = getattr(env, "task", None)
+    instance_id = getattr(task, "activity_instance_id", None)
+    if instance_id is None:
+        return None
+    return int(instance_id)
+
+
 def _moving_boxes_door_threshold():
     return float(
         os.environ.get(
@@ -610,24 +618,42 @@ def _moving_boxes_to_storage_progress(env):
     )
 
 
-# Task specifications
-CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
-    "turning_on_radio": lambda env: check_progress(
+def _picking_up_trash_near_threshold(env):
+    profile = _near_profile()
+    if profile in {"trash_eef020_mixed", "trash_eef_0.20_mixed", "eef_0.20_mixed"}:
+        instance_overrides = {
+            106: 0.30,
+            171: 0.10,
+        }
+        return instance_overrides.get(_activity_instance_id(env), 0.20)
+    return 0.20
+
+
+def _picking_up_trash_progress(env):
+    near_threshold = _picking_up_trash_near_threshold(env)
+    return check_progress(
         env,
         {
-            "robot_near_radio": ("near", "agent.n.01_1", "radio_receiver.n.01_1"),
-            "radio_picked_up": ("state", "radio_receiver.n.01_1", OnTop, "table.n.02_1", False),
-            "radio_on": ("state", "radio_receiver.n.01_1", ToggledOn, True),
-        },
-    ),
-    "picking_up_trash": lambda env: check_progress(
-        env,
-        {
-            "robot_near_trash_can": ("near_eef_threshold", "agent.n.01_1", "ashcan.n.01_1", 0.20),
+            "robot_near_trash_can": ("near_eef_threshold", "agent.n.01_1", "ashcan.n.01_1", near_threshold),
             "trash_can_picked_up": ("grasping", "agent.n.01_1", "ashcan.n.01_1", True),
-            "robot_near_can_of_soda_1": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_1", 0.20),
-            "robot_near_can_of_soda_2": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_2", 0.20),
-            "robot_near_can_of_soda_3": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_3", 0.20),
+            "robot_near_can_of_soda_1": (
+                "near_eef_threshold",
+                "agent.n.01_1",
+                "can__of__soda.n.01_1",
+                near_threshold,
+            ),
+            "robot_near_can_of_soda_2": (
+                "near_eef_threshold",
+                "agent.n.01_1",
+                "can__of__soda.n.01_2",
+                near_threshold,
+            ),
+            "robot_near_can_of_soda_3": (
+                "near_eef_threshold",
+                "agent.n.01_1",
+                "can__of__soda.n.01_3",
+                near_threshold,
+            ),
             "can_of_soda_1_picked_up": ("state", "can__of__soda.n.01_1", OnTop, "floor.n.01_1", False),
             "can_of_soda_2_picked_up": ("state", "can__of__soda.n.01_2", OnTop, "floor.n.01_1", False),
             "can_of_soda_3_picked_up": ("state", "can__of__soda.n.01_3", OnTop, "floor.n.01_1", False),
@@ -639,7 +665,20 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "can_of_soda_3_in_trash": ("state", "can__of__soda.n.01_3", Inside, "ashcan.n.01_1", True),
             "trash_can_on_floor": ("state", "ashcan.n.01_1", OnTop, "floor.n.01", True),
         },
+    )
+
+
+# Task specifications
+CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
+    "turning_on_radio": lambda env: check_progress(
+        env,
+        {
+            "robot_near_radio": ("near", "agent.n.01_1", "radio_receiver.n.01_1"),
+            "radio_picked_up": ("state", "radio_receiver.n.01_1", OnTop, "table.n.02_1", False),
+            "radio_on": ("state", "radio_receiver.n.01_1", ToggledOn, True),
+        },
     ),
+    "picking_up_trash": _picking_up_trash_progress,
     "putting_away_Halloween_decorations": lambda env: check_progress(
         env,
         {
