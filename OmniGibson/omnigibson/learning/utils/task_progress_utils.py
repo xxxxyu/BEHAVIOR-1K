@@ -69,7 +69,70 @@ def _debug_task_progress_open():
     return bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_OPEN"))
 
 
+def _debug_moving_boxes_object_poses(env):
+    if not bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_BOX_POSES")):
+        return
+
+    counter = getattr(_debug_moving_boxes_object_poses, "_counter", 0)
+    setattr(_debug_moving_boxes_object_poses, "_counter", counter + 1)
+    interval = max(1, int(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_BOX_POSES_INTERVAL", "10")))
+
+    container_specs = [
+        ("container_1", "storage_container.n.01_1"),
+        ("container_2", "storage_container.n.01_2"),
+    ]
+    on_garage = {
+        label: _check_state_spec(env, ("state", key, OnTop, "floor.n.01_2", True))
+        for label, key in container_specs
+    }
+    if counter % interval != 0 and not any(on_garage.values()):
+        return
+
+    scene = getattr(env, "scene", None)
+    seg_map = getattr(scene, "seg_map", None) if scene is not None else None
+
+    def pose_record(key):
+        entity = _resolve_object(env, key)
+        if not entity.exists:
+            return {"exists": False}
+        pos = entity.unwrapped.get_position_orientation()[0]
+        xy = pos[:2]
+        room = None
+        if seg_map is not None:
+            try:
+                room = seg_map.get_room_instance_by_point(xy)
+            except Exception as exc:
+                room = f"error:{type(exc).__name__}"
+        return {
+            "exists": True,
+            "pos": [float(v) for v in pos.tolist()],
+            "room": room,
+        }
+
+    robot_entity = _resolve_object(env, "agent.n.01_1")
+    robot_xy = None
+    if robot_entity.exists:
+        robot_xy = _robot_base_link(robot_entity.unwrapped).get_position_orientation()[0][:2]
+
+    records = {
+        "robot_xy": None if robot_xy is None else [float(v) for v in robot_xy.tolist()],
+        "garage_floor": pose_record("floor.n.01_2"),
+    }
+    for label, key in container_specs:
+        records[label] = pose_record(key)
+        records[label]["on_garage_floor"] = on_garage[label]
+        records[label]["grasped"] = _check_grasping_spec(env, ("grasping", "agent.n.01_1", key, True))
+
+    print(
+        "[task_progress_debug_boxes] "
+        f"counter={counter} records={records}",
+        flush=True,
+    )
+
+
 def _near_mode_and_thresholds(check_type, spec):
+    if check_type == "near_eef_threshold":
+        return "eef", float(spec[3]), None
     if check_type == "near_base_threshold":
         return "base", float(spec[3]), None
     if check_type in {"near_threshold", "near_category_threshold"}:
@@ -277,9 +340,10 @@ def check_progress(env, check_specs):
     for name, spec in check_specs.items():
         check_type = spec[0]
 
-        if check_type in {"near", "near_threshold", "near_base_threshold", "near_category_threshold"}:
+        if check_type in {"near", "near_threshold", "near_eef_threshold", "near_base_threshold", "near_category_threshold"}:
             # ("near", robot_key, obj_key) - robot should always be first.
             # ("near_threshold", robot_key, obj_key, threshold) allows task-local stricter navigation gates.
+            # ("near_eef_threshold", robot_key, obj_key, threshold) gates on end-effector distance only.
             # ("near_base_threshold", robot_key, obj_key, threshold) ignores arms/eef for navigation gates.
             # ("near_category_threshold", robot_key, category_key, threshold) accepts any category instance.
             robot_entity = _resolve_object(env, spec[1])
@@ -472,6 +536,80 @@ def check_progress(env, check_specs):
     return results
 
 
+def _moving_boxes_to_storage_progress(env):
+    _debug_moving_boxes_object_poses(env)
+    return check_progress(
+        env,
+        {
+            "robot_near_door": (
+                "near_base_threshold",
+                "agent.n.01_1",
+                "door_bexenl_0",
+                _moving_boxes_door_threshold(),
+            ),
+            "door_opened": ("open_fraction", "door_bexenl_0", _moving_boxes_door_open_threshold(), True),
+            "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
+            "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
+            "robot_near_garage_floor": (
+                "robot_in_room_zone_of",
+                "agent.n.01_1",
+                "floor.n.01_2",
+                _moving_boxes_garage_place_point,
+                _moving_boxes_garage_place_threshold,
+            ),
+            "container_1_picked_up": ("state", "storage_container.n.01_1", OnTop, "floor.n.01_1", False),
+            "container_2_picked_up": ("state", "storage_container.n.01_2", OnTop, "floor.n.01_1", False),
+            "container_1_in_garage": (
+                "all_state",
+                [
+                    ("state", "storage_container.n.01_1", OnTop, "floor.n.01_2", True),
+                    ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
+                ],
+            ),
+            "container_2_in_garage": (
+                "all_state",
+                [
+                    ("state", "storage_container.n.01_2", OnTop, "floor.n.01_2", True),
+                    ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
+                ],
+            ),
+            "containers_stacked": (
+                "any_state",
+                [
+                    (
+                        "all_state",
+                        [
+                            ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
+                            ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
+                        ],
+                    ),
+                    (
+                        "all_state",
+                        [
+                            ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
+                            ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
+                        ],
+                    ),
+                ],
+            ),
+            "container_1_stacked": (
+                "all_state",
+                [
+                    ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
+                    ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
+                ],
+            ),
+            "container_2_stacked": (
+                "all_state",
+                [
+                    ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
+                ],
+            ),
+        },
+    )
+
+
 # Task specifications
 CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "turning_on_radio": lambda env: check_progress(
@@ -485,11 +623,11 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "picking_up_trash": lambda env: check_progress(
         env,
         {
-            "robot_near_trash_can": ("near", "agent.n.01_1", "ashcan.n.01_1"),
+            "robot_near_trash_can": ("near_eef_threshold", "agent.n.01_1", "ashcan.n.01_1", 0.20),
             "trash_can_picked_up": ("grasping", "agent.n.01_1", "ashcan.n.01_1", True),
-            "robot_near_can_of_soda_1": ("near", "agent.n.01_1", "can__of__soda.n.01_1"),
-            "robot_near_can_of_soda_2": ("near", "agent.n.01_1", "can__of__soda.n.01_2"),
-            "robot_near_can_of_soda_3": ("near", "agent.n.01_1", "can__of__soda.n.01_3"),
+            "robot_near_can_of_soda_1": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_1", 0.20),
+            "robot_near_can_of_soda_2": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_2", 0.20),
+            "robot_near_can_of_soda_3": ("near_eef_threshold", "agent.n.01_1", "can__of__soda.n.01_3", 0.20),
             "can_of_soda_1_picked_up": ("state", "can__of__soda.n.01_1", OnTop, "floor.n.01_1", False),
             "can_of_soda_2_picked_up": ("state", "can__of__soda.n.01_2", OnTop, "floor.n.01_1", False),
             "can_of_soda_3_picked_up": ("state", "can__of__soda.n.01_3", OnTop, "floor.n.01_1", False),
@@ -838,76 +976,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "plywood_3_indoors": ("state", "plywood.n.01_3", OnTop, "floor.n.01_2", True),
         },
     ),
-    "moving_boxes_to_storage": lambda env: check_progress(
-        env,
-        {
-            "robot_near_door": (
-                "near_base_threshold",
-                "agent.n.01_1",
-                "door_bexenl_0",
-                _moving_boxes_door_threshold(),
-            ),
-            "door_opened": ("open_fraction", "door_bexenl_0", _moving_boxes_door_open_threshold(), True),
-            "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
-            "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
-            "robot_near_garage_floor": (
-                "robot_in_room_zone_of",
-                "agent.n.01_1",
-                "floor.n.01_2",
-                _moving_boxes_garage_place_point,
-                _moving_boxes_garage_place_threshold,
-            ),
-            "container_1_picked_up": ("state", "storage_container.n.01_1", OnTop, "floor.n.01_1", False),
-            "container_2_picked_up": ("state", "storage_container.n.01_2", OnTop, "floor.n.01_1", False),
-            "container_1_in_garage": (
-                "all_state",
-                [
-                    ("state", "storage_container.n.01_1", OnTop, "floor.n.01_2", True),
-                    ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
-                ],
-            ),
-            "container_2_in_garage": (
-                "all_state",
-                [
-                    ("state", "storage_container.n.01_2", OnTop, "floor.n.01_2", True),
-                    ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
-                ],
-            ),
-            "containers_stacked": (
-                "any_state",
-                [
-                    (
-                        "all_state",
-                        [
-                            ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
-                            ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
-                        ],
-                    ),
-                    (
-                        "all_state",
-                        [
-                            ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
-                            ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
-                        ],
-                    ),
-                ],
-            ),
-            "container_1_stacked": (
-                "all_state",
-                [
-                    ("state", "storage_container.n.01_1", OnTop, "storage_container.n.01_2", True),
-                    ("grasping", "agent.n.01_1", "storage_container.n.01_1", False),
-                ],
-            ),
-            "container_2_stacked": (
-                "all_state",
-                [
-                    ("state", "storage_container.n.01_2", OnTop, "storage_container.n.01_1", True),
-                    ("grasping", "agent.n.01_1", "storage_container.n.01_2", False),
-                ],
-            ),
-        },
-    ),
+    "moving_boxes_to_storage": _moving_boxes_to_storage_progress,
     "bringing_water": lambda env: check_progress(
         env,
         {
