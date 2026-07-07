@@ -700,8 +700,20 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "pumpkin_1_in_cabinet": ("state", "pumpkin.n.02_1", Inside, "cabinet.n.01_1", True),
             "pumpkin_2_in_cabinet": ("state", "pumpkin.n.02_2", Inside, "cabinet.n.01_1", True),
             "robot_near_caldron": ("near", "agent.n.01_1", "caldron.n.01_1"),
-            "caldron_picked_up": ("state", "caldron.n.01_1", OnTop, "floor.n.01_1", False),
-            "caldron_next_to_table": ("state", "caldron.n.01_1", NextTo, "table.n.02_1", True),
+            "caldron_picked_up": (
+                "all_state",
+                [
+                    ("state", "caldron.n.01_1", OnTop, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "caldron.n.01_1", True),
+                ],
+            ),
+            "caldron_next_to_table": (
+                "all_state",
+                [
+                    ("state", "caldron.n.01_1", NextTo, "table.n.02_1", True),
+                    ("grasping", "agent.n.01_1", "caldron.n.01_1", False),
+                ],
+            ),
         },
     ),
     "cleaning_up_plates_and_food": lambda env: check_progress(
@@ -845,12 +857,54 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_bed": ("near", "agent.n.01_1", "bed.n.01_1"),
             "robot_near_table": ("near", "agent.n.01_1", "table.n.02_1"),
             "robot_near_toy_box": ("near", "agent.n.01_1", "toy_box.n.01_1"),
-            "board_game_1_picked_up": ("state", "board_game.n.01_1", OnTop, "bed.n.01_1", False),
-            "board_game_2_picked_up": ("state", "board_game.n.01_2", OnTop, "bed.n.01_1", False),
-            "board_game_3_picked_up": ("state", "board_game.n.01_3", OnTop, "table.n.02_1", False),
-            "jigsaw_1_picked_up": ("state", "jigsaw_puzzle.n.01_1", OnTop, "table.n.02_1", False),
-            "jigsaw_2_picked_up": ("state", "jigsaw_puzzle.n.01_2", OnTop, "table.n.02_1", False),
-            "tennis_ball_picked_up": ("state", "tennis_ball.n.01_1", OnTop, "table.n.02_1", False),
+            "robot_near_board_game_1": ("near", "agent.n.01_1", "board_game.n.01_1"),
+            "robot_near_board_game_2": ("near", "agent.n.01_1", "board_game.n.01_2"),
+            "robot_near_board_game_3": ("near", "agent.n.01_1", "board_game.n.01_3"),
+            "robot_near_jigsaw_1": ("near", "agent.n.01_1", "jigsaw_puzzle.n.01_1"),
+            "robot_near_jigsaw_2": ("near", "agent.n.01_1", "jigsaw_puzzle.n.01_2"),
+            "robot_near_tennis_ball": ("near", "agent.n.01_1", "tennis_ball.n.01_1"),
+            "board_game_1_picked_up": (
+                "all_state",
+                [
+                    ("state", "board_game.n.01_1", OnTop, "bed.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "board_game.n.01_1", True),
+                ],
+            ),
+            "board_game_2_picked_up": (
+                "all_state",
+                [
+                    ("state", "board_game.n.01_2", OnTop, "bed.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "board_game.n.01_2", True),
+                ],
+            ),
+            "board_game_3_picked_up": (
+                "all_state",
+                [
+                    ("state", "board_game.n.01_3", OnTop, "table.n.02_1", False),
+                    ("grasping", "agent.n.01_1", "board_game.n.01_3", True),
+                ],
+            ),
+            "jigsaw_1_picked_up": (
+                "all_state",
+                [
+                    ("state", "jigsaw_puzzle.n.01_1", OnTop, "table.n.02_1", False),
+                    ("grasping", "agent.n.01_1", "jigsaw_puzzle.n.01_1", True),
+                ],
+            ),
+            "jigsaw_2_picked_up": (
+                "all_state",
+                [
+                    ("state", "jigsaw_puzzle.n.01_2", OnTop, "table.n.02_1", False),
+                    ("grasping", "agent.n.01_1", "jigsaw_puzzle.n.01_2", True),
+                ],
+            ),
+            "tennis_ball_picked_up": (
+                "all_state",
+                [
+                    ("state", "tennis_ball.n.01_1", OnTop, "table.n.02_1", False),
+                    ("grasping", "agent.n.01_1", "tennis_ball.n.01_1", True),
+                ],
+            ),
             "board_game_1_in_box": ("state", "board_game.n.01_1", Inside, "toy_box.n.01_1", True),
             "board_game_2_in_box": ("state", "board_game.n.01_2", Inside, "toy_box.n.01_1", True),
             "board_game_3_in_box": ("state", "board_game.n.01_3", Inside, "toy_box.n.01_1", True),
