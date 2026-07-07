@@ -24,6 +24,7 @@ PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
 MOVING_BOXES_DOOR_DISTANCE_THRESHOLD = 1.2
 MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD = 0.85
 MOVING_BOXES_GARAGE_PLACE_THRESHOLD = 1.0
+HALLOWEEN_CALDRON_LIFT_CLEARANCE_THRESHOLD = 0.08
 
 
 def _near_profile():
@@ -69,6 +70,15 @@ def _moving_boxes_garage_place_threshold():
         os.environ.get(
             "BEHAVIOR_TASK_PROGRESS_BOXES_GARAGE_PLACE_THRESHOLD",
             str(MOVING_BOXES_GARAGE_PLACE_THRESHOLD),
+        )
+    )
+
+
+def _halloween_caldron_lift_clearance_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_HALLOWEEN_CALDRON_LIFT_CLEARANCE",
+            str(HALLOWEEN_CALDRON_LIFT_CLEARANCE_THRESHOLD),
         )
     )
 
@@ -328,12 +338,32 @@ def _check_grasping_spec(env, spec):
     )
 
 
+def _check_aabb_bottom_above_spec(env, spec):
+    obj = _resolve_object(env, spec[1])
+    reference = _resolve_object(env, spec[2])
+    if not (obj.exists and reference.exists):
+        return False
+    obj_min, _ = obj.unwrapped.aabb
+    _, reference_max = reference.unwrapped.aabb
+    clearance = float((obj_min[2] - reference_max[2]).item())
+    result = clearance >= float(spec[3])
+    if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_AABB")):
+        print(
+            "[task_progress_debug_aabb] "
+            f"obj={spec[1]} reference={spec[2]} clearance={clearance} threshold={float(spec[3])} result={result}",
+            flush=True,
+        )
+    return result
+
+
 def _check_composite_spec(env, spec):
     check_type = spec[0]
     if check_type == "state":
         return _check_state_spec(env, spec)
     if check_type == "grasping":
         return _check_grasping_spec(env, spec)
+    if check_type == "aabb_bottom_above":
+        return _check_aabb_bottom_above_spec(env, spec)
     if check_type == "all_state":
         return all(_check_composite_spec(env, state_spec) for state_spec in spec[1])
     if check_type == "any_state":
@@ -512,6 +542,10 @@ def check_progress(env, check_specs):
         elif check_type == "grasping":
             # ("grasping", robot_key, obj_key, expected_bool) - robot is grasping object
             results[name] = _check_grasping_spec(env, spec)
+
+        elif check_type == "aabb_bottom_above":
+            # ("aabb_bottom_above", obj_key, reference_key, threshold) checks object clearance above a support.
+            results[name] = _check_aabb_bottom_above_spec(env, spec)
 
         elif check_type == "open_fraction":
             # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
@@ -703,8 +737,13 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "caldron_picked_up": (
                 "all_state",
                 [
-                    ("state", "caldron.n.01_1", OnTop, "floor.n.01_1", False),
                     ("grasping", "agent.n.01_1", "caldron.n.01_1", True),
+                    (
+                        "aabb_bottom_above",
+                        "caldron.n.01_1",
+                        "floor.n.01_1",
+                        _halloween_caldron_lift_clearance_threshold(),
+                    ),
                 ],
             ),
             "caldron_next_to_table": (
