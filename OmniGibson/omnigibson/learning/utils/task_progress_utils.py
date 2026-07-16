@@ -180,6 +180,10 @@ def _popcorn_open_fraction_threshold():
     )
 
 
+def _task_open_fraction_threshold(env_name):
+    return float(os.environ.get(env_name, str(PROGRESS_OPEN_FRACTION_THRESHOLD)))
+
+
 def _debug_task_progress_open():
     return bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_OPEN"))
 
@@ -1248,9 +1252,20 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "bringing_water": lambda env: check_progress(
         env,
         {
-            "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
-            "robot_near_coffee_table": ("near", "agent.n.01_1", "coffee_table.n.01_1"),
-            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "robot_near_fridge": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_WATER_FRIDGE_EEF_THRESHOLD",
+                "electric_refrigerator.n.01_1",
+            ),
+            "robot_near_coffee_table": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_WATER_TABLE_EEF_THRESHOLD",
+                "coffee_table.n.01_1",
+            ),
+            "fridge_opened": (
+                "open_fraction",
+                "electric_refrigerator.n.01_1",
+                _task_open_fraction_threshold("BEHAVIOR_TASK_PROGRESS_WATER_FRIDGE_OPEN_FRACTION"),
+                True,
+            ),
             "bottle_1_picked_up": (
                 "all_state",
                 [
@@ -1965,8 +1980,14 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "cook_hot_dogs": lambda env: check_progress(
         env,
         {
-            "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
-            "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
+            "robot_near_fridge": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_HOTDOG_FRIDGE_EEF_THRESHOLD",
+                "electric_refrigerator.n.01_1",
+            ),
+            "robot_near_microwave": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_HOTDOG_MICROWAVE_EEF_THRESHOLD",
+                "microwave.n.02_1",
+            ),
             "robot_near_hotdog_1": _optional_task_eef_near_spec(
                 "BEHAVIOR_TASK_PROGRESS_HOTDOG_PICKUP_EEF_THRESHOLD",
                 "hotdog.n.02_1",
@@ -1975,7 +1996,12 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
                 "BEHAVIOR_TASK_PROGRESS_HOTDOG_PICKUP_EEF_THRESHOLD",
                 "hotdog.n.02_2",
             ),
-            "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "fridge_opened": (
+                "open_fraction",
+                "electric_refrigerator.n.01_1",
+                _task_open_fraction_threshold("BEHAVIOR_TASK_PROGRESS_HOTDOG_FRIDGE_OPEN_FRACTION"),
+                True,
+            ),
             "hotdog_1_retrieved": (
                 "all_state",
                 (
@@ -1993,7 +2019,12 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "hotdog_1_grasped": ("grasping", "agent.n.01_1", "hotdog.n.02_1", True),
             "hotdog_2_grasped": ("grasping", "agent.n.01_1", "hotdog.n.02_2", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
-            "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "microwave_opened": (
+                "open_fraction",
+                "microwave.n.02_1",
+                _task_open_fraction_threshold("BEHAVIOR_TASK_PROGRESS_HOTDOG_MICROWAVE_OPEN_FRACTION"),
+                True,
+            ),
             "hotdog_1_on_countertop": (
                 "all_state",
                 (
