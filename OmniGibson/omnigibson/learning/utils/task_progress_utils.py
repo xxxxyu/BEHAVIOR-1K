@@ -1240,12 +1240,29 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_plywood_1": ("near", "agent.n.01_1", "plywood.n.01_1"),
             "robot_near_plywood_2": ("near", "agent.n.01_1", "plywood.n.01_2"),
             "robot_near_plywood_3": ("near", "agent.n.01_1", "plywood.n.01_3"),
-            "plywood_1_picked_up": ("state", "plywood.n.01_1", OnTop, "floor.n.01_1", False),
-            "plywood_2_picked_up": ("state", "plywood.n.01_2", OnTop, "floor.n.01_1", False),
-            "plywood_3_picked_up": ("state", "plywood.n.01_3", OnTop, "floor.n.01_1", False),
-            "plywood_1_indoors": ("state", "plywood.n.01_1", OnTop, "floor.n.01_2", True),
-            "plywood_2_indoors": ("state", "plywood.n.01_2", OnTop, "floor.n.01_2", True),
-            "plywood_3_indoors": ("state", "plywood.n.01_3", OnTop, "floor.n.01_2", True),
+            "robot_near_wood_door": ("near", "agent.n.01_1", "door_vudhlc_1"),
+            "wood_door_opened": ("open_fraction", "door_vudhlc_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "robot_in_corridor": ("robot_in_room_of", "agent.n.01_1", "floor.n.01_2"),
+            **{
+                f"plywood_{index}_picked_up": (
+                    "all_state",
+                    [
+                        ("state", f"plywood.n.01_{index}", OnTop, "floor.n.01_1", False),
+                        ("grasping", "agent.n.01_1", f"plywood.n.01_{index}", True),
+                    ],
+                )
+                for index in (1, 2, 3)
+            },
+            **{
+                f"plywood_{index}_indoors": (
+                    "all_state",
+                    [
+                        ("state", f"plywood.n.01_{index}", OnTop, "floor.n.01_2", True),
+                        ("grasping", "agent.n.01_1", f"plywood.n.01_{index}", False),
+                    ],
+                )
+                for index in (1, 2, 3)
+            },
         },
     ),
     "moving_boxes_to_storage": _moving_boxes_to_storage_progress,
@@ -1795,11 +1812,37 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "clean_a_trumpet": lambda env: check_progress(
         env,
         {
-            "robot_near_desk": ("near", "agent.n.01_1", "desk.n.01_1"),
             "robot_near_scrub_brush": ("near", "agent.n.01_1", "scrub_brush.n.01_1"),
             "robot_near_cornet": ("near", "agent.n.01_1", "cornet.n.01_1"),
-            "scrub_brush_picked_up": ("state", "scrub_brush.n.01_1", OnTop, "desk.n.01_1", False),
+            "scrub_brush_picked_up": (
+                "all_state",
+                [
+                    ("state", "scrub_brush.n.01_1", OnTop, "desk.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "scrub_brush.n.01_1", True),
+                ],
+            ),
+            "scrub_brush_grasped_left": (
+                "grasping_arm",
+                "agent.n.01_1",
+                "scrub_brush.n.01_1",
+                "left",
+                True,
+            ),
+            "scrub_brush_grasped_right": (
+                "grasping_arm",
+                "agent.n.01_1",
+                "scrub_brush.n.01_1",
+                "right",
+                True,
+            ),
             "cornet_completely_clean": ("state", "cornet.n.01_1", Covered, "dust.n.01_1", False),
+            "scrub_brush_released_on_desk": (
+                "all_state",
+                [
+                    ("state", "scrub_brush.n.01_1", OnTop, "desk.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "scrub_brush.n.01_1", False),
+                ],
+            ),
         },
     ),
     "spraying_for_bugs": lambda env: check_progress(
