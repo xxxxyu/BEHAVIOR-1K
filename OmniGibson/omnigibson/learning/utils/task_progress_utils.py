@@ -23,8 +23,19 @@ ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
 PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
 MOVING_BOXES_DOOR_DISTANCE_THRESHOLD = 1.2
 MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD = 0.85
-MOVING_BOXES_GARAGE_PLACE_THRESHOLD = 1.0
+MOVING_BOXES_CONTAINER_EEF_THRESHOLD = 0.4
+MOVING_BOXES_GARAGE_PLACE_X = -2.44
+MOVING_BOXES_GARAGE_PLACE_Y = 3.40
+MOVING_BOXES_GARAGE_PLACE_THRESHOLD = 1.25
 HALLOWEEN_CALDRON_LIFT_CLEARANCE_THRESHOLD = 0.08
+HALLOWEEN_PICKUP_EEF_THRESHOLD = 0.5
+HALLOWEEN_SUPPORT_EEF_THRESHOLD = 0.5
+SHOES_PICKUP_EEF_THRESHOLD = 0.2
+SHOES_HALLSTAND_THRESHOLD = 1.0
+BUGS_PICKUP_EEF_THRESHOLD = 0.4
+BUGS_SPRAY_EEF_THRESHOLD = 0.5
+POPCORN_OPEN_EEF_THRESHOLD = 1.0
+POPCORN_OPEN_FRACTION_THRESHOLD = 0.85
 
 
 def _near_profile():
@@ -58,10 +69,14 @@ def _moving_boxes_door_open_threshold():
 
 
 def _moving_boxes_garage_place_point():
-    x = os.environ.get("BEHAVIOR_TASK_PROGRESS_BOXES_GARAGE_PLACE_X")
-    y = os.environ.get("BEHAVIOR_TASK_PROGRESS_BOXES_GARAGE_PLACE_Y")
-    if x is None or y is None:
-        return None
+    x = os.environ.get(
+        "BEHAVIOR_TASK_PROGRESS_BOXES_GARAGE_PLACE_X",
+        str(MOVING_BOXES_GARAGE_PLACE_X),
+    )
+    y = os.environ.get(
+        "BEHAVIOR_TASK_PROGRESS_BOXES_GARAGE_PLACE_Y",
+        str(MOVING_BOXES_GARAGE_PLACE_Y),
+    )
     return th.tensor([float(x), float(y)])
 
 
@@ -83,8 +98,112 @@ def _halloween_caldron_lift_clearance_threshold():
     )
 
 
+def _halloween_pickup_near_spec(obj_key):
+    threshold = os.environ.get(
+        "BEHAVIOR_TASK_PROGRESS_HALLOWEEN_PICKUP_EEF_THRESHOLD",
+        str(HALLOWEEN_PICKUP_EEF_THRESHOLD),
+    )
+    if threshold.strip().lower() in {"current", "any"}:
+        return ("near", "agent.n.01_1", obj_key)
+    return ("near_eef_threshold", "agent.n.01_1", obj_key, float(threshold))
+
+
+def _halloween_support_near_spec(obj_key):
+    eef_threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_HALLOWEEN_SUPPORT_EEF_THRESHOLD")
+    if eef_threshold is not None:
+        if eef_threshold.strip().lower() in {"current", "any"}:
+            return ("near", "agent.n.01_1", obj_key)
+        return ("near_eef_threshold", "agent.n.01_1", obj_key, float(eef_threshold))
+    base_threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_HALLOWEEN_SUPPORT_BASE_THRESHOLD")
+    if base_threshold is not None:
+        return ("near_base_threshold", "agent.n.01_1", obj_key, float(base_threshold))
+    return ("near_eef_threshold", "agent.n.01_1", obj_key, HALLOWEEN_SUPPORT_EEF_THRESHOLD)
+
+
+def _shoes_hallstand_near_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_SHOES_HALLSTAND_THRESHOLD",
+            str(SHOES_HALLSTAND_THRESHOLD),
+        )
+    )
+
+
+def _shoes_pickup_near_spec(obj_key):
+    threshold = float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_SHOES_PICKUP_EEF_THRESHOLD",
+            str(SHOES_PICKUP_EEF_THRESHOLD),
+        )
+    )
+    return ("near_eef_threshold", "agent.n.01_1", obj_key, threshold)
+
+
+def _moving_boxes_container_near_spec(obj_key):
+    threshold = float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_BOXES_PICKUP_EEF_THRESHOLD",
+            str(MOVING_BOXES_CONTAINER_EEF_THRESHOLD),
+        )
+    )
+    return ("near_eef_threshold", "agent.n.01_1", obj_key, threshold)
+
+
+def _optional_task_eef_near_spec(env_name, obj_key, default_threshold=None):
+    threshold = os.environ.get(env_name)
+    if threshold is None:
+        if default_threshold is None:
+            return ("near", "agent.n.01_1", obj_key)
+        threshold = default_threshold
+    if str(threshold).strip().lower() in {"current", "any"}:
+        return ("near", "agent.n.01_1", obj_key)
+    return ("near_eef_threshold", "agent.n.01_1", obj_key, float(threshold))
+
+
+def _bugs_plant_near_spec(obj_key):
+    base_threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_BUGS_SPRAY_BASE_THRESHOLD")
+    if base_threshold is not None:
+        return ("near_base_threshold", "agent.n.01_1", obj_key, float(base_threshold))
+    return _optional_task_eef_near_spec(
+        "BEHAVIOR_TASK_PROGRESS_BUGS_SPRAY_EEF_THRESHOLD",
+        obj_key,
+        BUGS_SPRAY_EEF_THRESHOLD,
+    )
+
+
+def _popcorn_open_fraction_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_POPCORN_OPEN_FRACTION_THRESHOLD",
+            str(POPCORN_OPEN_FRACTION_THRESHOLD),
+        )
+    )
+
+
 def _debug_task_progress_open():
     return bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_OPEN"))
+
+
+def _debug_composite_progress(name, spec, component_results):
+    requested = {
+        item.strip()
+        for item in os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_COMPOSITE", "").split(",")
+        if item.strip()
+    }
+    if name not in requested:
+        return
+
+    current = tuple(bool(result) for result in component_results)
+    previous = getattr(_debug_composite_progress, "_previous", {})
+    if previous.get(name) == current:
+        return
+    previous[name] = current
+    setattr(_debug_composite_progress, "_previous", previous)
+    print(
+        "[task_progress_debug_composite] "
+        f"name={name} result={all(current)} components={list(zip(spec[1], current))}",
+        flush=True,
+    )
 
 
 def _debug_moving_boxes_object_poses(env):
@@ -338,6 +457,14 @@ def _check_grasping_spec(env, spec):
     )
 
 
+def _check_arm_grasping_spec(env, spec):
+    robot, obj = _resolve_object(env, spec[1]), _resolve_object(env, spec[2])
+    if not (robot.exists and obj.exists):
+        return False
+    result = robot.unwrapped.is_grasping(arm=spec[3], candidate_obj=obj.unwrapped)
+    return (int(result) == 1) == spec[4]
+
+
 def _check_aabb_bottom_above_spec(env, spec):
     obj = _resolve_object(env, spec[1])
     reference = _resolve_object(env, spec[2])
@@ -362,6 +489,8 @@ def _check_composite_spec(env, spec):
         return _check_state_spec(env, spec)
     if check_type == "grasping":
         return _check_grasping_spec(env, spec)
+    if check_type == "grasping_arm":
+        return _check_arm_grasping_spec(env, spec)
     if check_type == "aabb_bottom_above":
         return _check_aabb_bottom_above_spec(env, spec)
     if check_type == "all_state":
@@ -537,11 +666,17 @@ def check_progress(env, check_specs):
 
         elif check_type == "all_state":
             # ("all_state", [state_spec, ...]) - useful for grouped progress stages.
-            results[name] = all(_check_composite_spec(env, state_spec) for state_spec in spec[1])
+            component_results = [_check_composite_spec(env, state_spec) for state_spec in spec[1]]
+            results[name] = all(component_results)
+            _debug_composite_progress(name, spec, component_results)
 
         elif check_type == "grasping":
             # ("grasping", robot_key, obj_key, expected_bool) - robot is grasping object
             results[name] = _check_grasping_spec(env, spec)
+
+        elif check_type == "grasping_arm":
+            # ("grasping_arm", robot_key, obj_key, arm, expected_bool)
+            results[name] = _check_arm_grasping_spec(env, spec)
 
         elif check_type == "aabb_bottom_above":
             # ("aabb_bottom_above", obj_key, reference_key, threshold) checks object clearance above a support.
@@ -590,8 +725,8 @@ def _moving_boxes_to_storage_progress(env):
                 _moving_boxes_door_threshold(),
             ),
             "door_opened": ("open_fraction", "door_bexenl_0", _moving_boxes_door_open_threshold(), True),
-            "robot_near_container_1": ("near", "agent.n.01_1", "storage_container.n.01_1"),
-            "robot_near_container_2": ("near", "agent.n.01_1", "storage_container.n.01_2"),
+            "robot_near_container_1": _moving_boxes_container_near_spec("storage_container.n.01_1"),
+            "robot_near_container_2": _moving_boxes_container_near_spec("storage_container.n.01_2"),
             "robot_near_garage_floor": (
                 "robot_in_room_zone_of",
                 "agent.n.01_1",
@@ -716,24 +851,24 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "putting_away_Halloween_decorations": lambda env: check_progress(
         env,
         {
-            "robot_near_cabinet": ("near", "agent.n.01_1", "cabinet.n.01_1"),
+            "robot_near_cabinet": _halloween_support_near_spec("cabinet.n.01_1"),
             "cabinet_open": ("open_fraction", "cabinet.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "robot_near_candle_1": ("near", "agent.n.01_1", "candle.n.01_1"),
-            "robot_near_candle_2": ("near", "agent.n.01_1", "candle.n.01_2"),
-            "robot_near_candle_3": ("near", "agent.n.01_1", "candle.n.01_3"),
+            "robot_near_candle_1": _halloween_pickup_near_spec("candle.n.01_1"),
+            "robot_near_candle_2": _halloween_pickup_near_spec("candle.n.01_2"),
+            "robot_near_candle_3": _halloween_pickup_near_spec("candle.n.01_3"),
             "candle_1_picked_up": ("state", "candle.n.01_1", OnTop, "floor.n.01_1", False),
             "candle_2_picked_up": ("state", "candle.n.01_2", OnTop, "floor.n.01_1", False),
             "candle_3_picked_up": ("state", "candle.n.01_3", OnTop, "floor.n.01_1", False),
             "candle_1_in_cabinet": ("state", "candle.n.01_1", Inside, "cabinet.n.01_1", True),
             "candle_2_in_cabinet": ("state", "candle.n.01_2", Inside, "cabinet.n.01_1", True),
             "candle_3_in_cabinet": ("state", "candle.n.01_3", Inside, "cabinet.n.01_1", True),
-            "robot_near_pumpkin_1": ("near", "agent.n.01_1", "pumpkin.n.02_1"),
-            "robot_near_pumpkin_2": ("near", "agent.n.01_1", "pumpkin.n.02_2"),
+            "robot_near_pumpkin_1": _halloween_pickup_near_spec("pumpkin.n.02_1"),
+            "robot_near_pumpkin_2": _halloween_pickup_near_spec("pumpkin.n.02_2"),
             "pumpkin_1_picked_up": ("state", "pumpkin.n.02_1", OnTop, "floor.n.01_1", False),
             "pumpkin_2_picked_up": ("state", "pumpkin.n.02_2", OnTop, "floor.n.01_1", False),
             "pumpkin_1_in_cabinet": ("state", "pumpkin.n.02_1", Inside, "cabinet.n.01_1", True),
             "pumpkin_2_in_cabinet": ("state", "pumpkin.n.02_2", Inside, "cabinet.n.01_1", True),
-            "robot_near_caldron": ("near", "agent.n.01_1", "caldron.n.01_1"),
+            "robot_near_caldron": _halloween_pickup_near_spec("caldron.n.01_1"),
             "caldron_picked_up": (
                 "all_state",
                 [
@@ -746,6 +881,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
                     ),
                 ],
             ),
+            "robot_near_table": _halloween_support_near_spec("table.n.02_1"),
             "caldron_next_to_table": (
                 "all_state",
                 [
@@ -1115,11 +1251,51 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_coffee_table": ("near", "agent.n.01_1", "coffee_table.n.01_1"),
             "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "bottle_1_picked_up": ("state", "bottle.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
-            "bottle_2_picked_up": ("state", "bottle.n.01_2", Inside, "electric_refrigerator.n.01_1", False),
+            "bottle_1_picked_up": (
+                "all_state",
+                [
+                    ("state", "bottle.n.01_1", Inside, "electric_refrigerator.n.01_1", False),
+                    (
+                        "any_state",
+                        [
+                            ("grasping_arm", "agent.n.01_1", "bottle.n.01_1", "left", True),
+                            ("grasping_arm", "agent.n.01_1", "bottle.n.01_1", "right", True),
+                        ],
+                    ),
+                ],
+            ),
+            "bottle_2_picked_up": (
+                "all_state",
+                [
+                    ("state", "bottle.n.01_2", Inside, "electric_refrigerator.n.01_1", False),
+                    (
+                        "any_state",
+                        [
+                            ("grasping_arm", "agent.n.01_1", "bottle.n.01_2", "left", True),
+                            ("grasping_arm", "agent.n.01_1", "bottle.n.01_2", "right", True),
+                        ],
+                    ),
+                ],
+            ),
+            "bottle_1_grasped_left": ("grasping_arm", "agent.n.01_1", "bottle.n.01_1", "left", True),
+            "bottle_1_grasped_right": ("grasping_arm", "agent.n.01_1", "bottle.n.01_1", "right", True),
+            "bottle_2_grasped_left": ("grasping_arm", "agent.n.01_1", "bottle.n.01_2", "left", True),
+            "bottle_2_grasped_right": ("grasping_arm", "agent.n.01_1", "bottle.n.01_2", "right", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
-            "bottle_1_on_table": ("state", "bottle.n.01_1", OnTop, "coffee_table.n.01_1", True),
-            "bottle_2_on_table": ("state", "bottle.n.01_2", OnTop, "coffee_table.n.01_1", True),
+            "bottle_1_on_table": (
+                "all_state",
+                [
+                    ("state", "bottle.n.01_1", OnTop, "coffee_table.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "bottle.n.01_1", False),
+                ],
+            ),
+            "bottle_2_on_table": (
+                "all_state",
+                [
+                    ("state", "bottle.n.01_2", OnTop, "coffee_table.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "bottle.n.01_2", False),
+                ],
+            ),
         },
     ),
     "tidying_bedroom": lambda env: check_progress(
@@ -1208,11 +1384,16 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "putting_shoes_on_rack": lambda env: check_progress(
         env,
         {
-            "robot_near_gym_shoe_1": ("near", "agent.n.01_1", "gym_shoe.n.01_1"),
-            "robot_near_gym_shoe_2": ("near", "agent.n.01_1", "gym_shoe.n.01_2"),
-            "robot_near_sandal_1": ("near", "agent.n.01_1", "sandal.n.01_1"),
-            "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
-            "robot_near_hallstand": ("near_threshold", "agent.n.01_1", "hallstand.n.01_1", 0.8),
+            "robot_near_gym_shoe_1": _shoes_pickup_near_spec("gym_shoe.n.01_1"),
+            "robot_near_gym_shoe_2": _shoes_pickup_near_spec("gym_shoe.n.01_2"),
+            "robot_near_sandal_1": _shoes_pickup_near_spec("sandal.n.01_1"),
+            "robot_near_sandal_2": _shoes_pickup_near_spec("sandal.n.01_2"),
+            "robot_near_hallstand": (
+                "near_threshold",
+                "agent.n.01_1",
+                "hallstand.n.01_1",
+                _shoes_hallstand_near_threshold(),
+            ),
             "gym_shoe_1_picked_up": ("grasping", "agent.n.01_1", "gym_shoe.n.01_1", True),
             "gym_shoe_2_picked_up": ("grasping", "agent.n.01_1", "gym_shoe.n.01_2", True),
             "sandal_1_picked_up": ("grasping", "agent.n.01_1", "sandal.n.01_1", True),
@@ -1547,8 +1728,14 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "hanging_pictures": lambda env: check_progress(
         env,
         {
-            "robot_near_poster": ("near", "agent.n.01_1", "poster.n.01_1"),
-            "robot_near_wall_nail": ("near", "agent.n.01_1", "wall_nail.n.01_1"),
+            "robot_near_poster": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_PICTURES_PICKUP_EEF_THRESHOLD",
+                "poster.n.01_1",
+            ),
+            "robot_near_wall_nail": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_PICTURES_HANG_EEF_THRESHOLD",
+                "wall_nail.n.01_1",
+            ),
             "poster_picked_up": ("state", "poster.n.01_1", OnTop, "countertop.n.01_1", False),
             "poster_attached_to_nail": ("state", "poster.n.01_1", AttachedTo, "wall_nail.n.01_1", True),
         },
@@ -1556,11 +1743,30 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "attach_a_camera_to_a_tripod": lambda env: check_progress(
         env,
         {
-            "robot_near_camera": ("near", "agent.n.01_1", "digital_camera.n.01_1"),
-            "robot_near_tripod": ("near", "agent.n.01_1", "camera_tripod.n.01_1"),
-            "camera_picked_up": ("state", "digital_camera.n.01_1", OnTop, "floor.n.01_1", False),
-            "tripod_picked_up": ("state", "camera_tripod.n.01_1", OnTop, "floor.n.01_1", False),
+            "robot_near_camera": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_CAMERA_PICKUP_EEF_THRESHOLD",
+                "digital_camera.n.01_1",
+            ),
+            "robot_near_tripod": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_CAMERA_TRIPOD_EEF_THRESHOLD",
+                "camera_tripod.n.01_1",
+            ),
+            "camera_picked_up": (
+                "all_state",
+                (
+                    ("state", "digital_camera.n.01_1", OnTop, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "digital_camera.n.01_1", True),
+                ),
+            ),
+            "tripod_held": ("grasping", "agent.n.01_1", "camera_tripod.n.01_1", True),
             "camera_attached_to_tripod": ("state", "digital_camera.n.01_1", AttachedTo, "camera_tripod.n.01_1", True),
+            "tripod_released": (
+                "all_state",
+                (
+                    ("state", "digital_camera.n.01_1", AttachedTo, "camera_tripod.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "camera_tripod.n.01_1", False),
+                ),
+            ),
         },
     ),
     "clean_a_patio": lambda env: check_progress(
@@ -1584,10 +1790,20 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "spraying_for_bugs": lambda env: check_progress(
         env,
         {
-            "robot_near_atomizer": ("near", "agent.n.01_1", "insectifuge__atomizer.n.01_1"),
-            "robot_near_plant_1": ("near", "agent.n.01_1", "pot_plant.n.01_1"),
-            "robot_near_plant_2": ("near", "agent.n.01_1", "pot_plant.n.01_2"),
-            "atomizer_picked_up": ("state", "insectifuge__atomizer.n.01_1", OnTop, "floor.n.01_1", False),
+            "robot_near_atomizer": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_BUGS_PICKUP_EEF_THRESHOLD",
+                "insectifuge__atomizer.n.01_1",
+                BUGS_PICKUP_EEF_THRESHOLD,
+            ),
+            "robot_near_plant_1": _bugs_plant_near_spec("pot_plant.n.01_1"),
+            "robot_near_plant_2": _bugs_plant_near_spec("pot_plant.n.01_2"),
+            "atomizer_picked_up": (
+                "all_state",
+                [
+                    ("state", "insectifuge__atomizer.n.01_1", OnTop, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "insectifuge__atomizer.n.01_1", True),
+                ],
+            ),
             "atomizer_turned_on": ("state", "insectifuge__atomizer.n.01_1", ToggledOn, True),
             "plant_1_covered": ("state", "pot_plant.n.01_1", Covered, "insectifuge.n.01_1", True),
             "plant_2_covered": ("state", "pot_plant.n.01_2", Covered, "insectifuge.n.01_1", True),
@@ -1597,10 +1813,25 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "spraying_fruit_trees": lambda env: check_progress(
         env,
         {
-            "robot_near_atomizer": ("near", "agent.n.01_1", "pesticide__atomizer.n.01_1"),
-            "robot_near_tree_1": ("near", "agent.n.01_1", "tree.n.01_1"),
-            "robot_near_tree_2": ("near", "agent.n.01_1", "tree.n.01_2"),
-            "atomizer_picked_up": ("state", "pesticide__atomizer.n.01_1", OnTop, "floor.n.01_1", False),
+            "robot_near_atomizer": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_FRUIT_TREES_PICKUP_EEF_THRESHOLD",
+                "pesticide__atomizer.n.01_1",
+            ),
+            "robot_near_tree_1": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_FRUIT_TREES_SPRAY_EEF_THRESHOLD",
+                "tree.n.01_1",
+            ),
+            "robot_near_tree_2": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_FRUIT_TREES_SPRAY_EEF_THRESHOLD",
+                "tree.n.01_2",
+            ),
+            "atomizer_picked_up": (
+                "all_state",
+                [
+                    ("state", "pesticide__atomizer.n.01_1", OnTop, "floor.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "pesticide__atomizer.n.01_1", True),
+                ],
+            ),
             "atomizer_turned_on": ("state", "pesticide__atomizer.n.01_1", ToggledOn, True),
             "tree_1_covered": ("state", "tree.n.01_1", Covered, "pesticide.n.01_1", True),
             "tree_2_covered": ("state", "tree.n.01_2", Covered, "pesticide.n.01_1", True),
@@ -1610,11 +1841,39 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "make_microwave_popcorn": lambda env: check_progress(
         env,
         {
-            "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
-            "robot_near_popcorn_bag": ("near", "agent.n.01_1", "popcorn__bag.n.01_1"),
-            "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "popcorn_bag_picked_up": ("state", "popcorn__bag.n.01_1", OnTop, "countertop.n.01_1", False),
-            "popcorn_bag_in_microwave": ("state", "popcorn__bag.n.01_1", Inside, "microwave.n.02_1", True),
+            "robot_near_microwave_open": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_POPCORN_OPEN_EEF_THRESHOLD",
+                "microwave.n.02_1",
+                POPCORN_OPEN_EEF_THRESHOLD,
+            ),
+            "robot_near_popcorn_bag": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_POPCORN_PICKUP_EEF_THRESHOLD",
+                "popcorn__bag.n.01_1",
+            ),
+            "robot_near_microwave_place": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_POPCORN_PLACE_EEF_THRESHOLD",
+                "microwave.n.02_1",
+            ),
+            "microwave_opened": (
+                "open_fraction",
+                "microwave.n.02_1",
+                _popcorn_open_fraction_threshold(),
+                True,
+            ),
+            "popcorn_bag_picked_up": (
+                "all_state",
+                [
+                    ("state", "popcorn__bag.n.01_1", OnTop, "countertop.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "popcorn__bag.n.01_1", True),
+                ],
+            ),
+            "popcorn_bag_in_microwave": (
+                "all_state",
+                [
+                    ("state", "popcorn__bag.n.01_1", Inside, "microwave.n.02_1", True),
+                    ("grasping", "agent.n.01_1", "popcorn__bag.n.01_1", False),
+                ],
+            ),
             "microwave_closed": ("state", "microwave.n.02_1", Open, False),
             "microwave_turned_on": ("state", "microwave.n.02_1", ToggledOn, True),
             "popcorn_cooked": ("exists", "cooked__popcorn.n.01_1", True),
@@ -1708,13 +1967,61 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
             "robot_near_microwave": ("near", "agent.n.01_1", "microwave.n.02_1"),
+            "robot_near_hotdog_1": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_HOTDOG_PICKUP_EEF_THRESHOLD",
+                "hotdog.n.02_1",
+            ),
+            "robot_near_hotdog_2": _optional_task_eef_near_spec(
+                "BEHAVIOR_TASK_PROGRESS_HOTDOG_PICKUP_EEF_THRESHOLD",
+                "hotdog.n.02_2",
+            ),
             "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "hotdog_1_retrieved": ("state", "hotdog.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
-            "hotdog_2_retrieved": ("state", "hotdog.n.02_2", Inside, "electric_refrigerator.n.01_1", False),
+            "hotdog_1_retrieved": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_1", Inside, "electric_refrigerator.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_1", True),
+                ),
+            ),
+            "hotdog_2_retrieved": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_2", Inside, "electric_refrigerator.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_2", True),
+                ),
+            ),
+            "hotdog_1_grasped": ("grasping", "agent.n.01_1", "hotdog.n.02_1", True),
+            "hotdog_2_grasped": ("grasping", "agent.n.01_1", "hotdog.n.02_2", True),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
             "microwave_opened": ("open_fraction", "microwave.n.02_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "hotdog_1_in_microwave": ("state", "hotdog.n.02_1", Inside, "microwave.n.02_1", True),
-            "hotdog_2_in_microwave": ("state", "hotdog.n.02_2", Inside, "microwave.n.02_1", True),
+            "hotdog_1_on_countertop": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_1", OnTop, "countertop.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_1", False),
+                ),
+            ),
+            "hotdog_2_on_countertop": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_2", OnTop, "countertop.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_2", False),
+                ),
+            ),
+            "hotdog_1_in_microwave": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_1", Inside, "microwave.n.02_1", True),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_1", False),
+                ),
+            ),
+            "hotdog_2_in_microwave": (
+                "all_state",
+                (
+                    ("state", "hotdog.n.02_2", Inside, "microwave.n.02_1", True),
+                    ("grasping", "agent.n.01_1", "hotdog.n.02_2", False),
+                ),
+            ),
             "microwave_closed": ("state", "microwave.n.02_1", Open, False),
             "microwave_on": ("state", "microwave.n.02_1", ToggledOn, True),
             "hotdog_1_cooked": ("state", "hotdog.n.02_1", Cooked, True),
