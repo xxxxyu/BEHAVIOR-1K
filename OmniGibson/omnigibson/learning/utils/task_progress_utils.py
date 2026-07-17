@@ -160,6 +160,24 @@ def _optional_task_eef_near_spec(env_name, obj_key, default_threshold=None):
     return ("near_eef_threshold", "agent.n.01_1", obj_key, float(threshold))
 
 
+def _wood_plywood_near_spec(obj_key):
+    return _optional_task_eef_near_spec(
+        "BEHAVIOR_TASK_PROGRESS_WOOD_PICKUP_EEF_THRESHOLD",
+        obj_key,
+    )
+
+
+def _wood_door_near_spec():
+    threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_WOOD_DOOR_BASE_THRESHOLD")
+    if threshold is None:
+        return ("near", "agent.n.01_1", "door_vudhlc_1")
+    return ("near_base_threshold", "agent.n.01_1", "door_vudhlc_1", float(threshold))
+
+
+def _wood_door_open_threshold():
+    return _task_open_fraction_threshold("BEHAVIOR_TASK_PROGRESS_WOOD_DOOR_OPEN_FRACTION")
+
+
 def _bugs_plant_near_spec(obj_key):
     base_threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_BUGS_SPRAY_BASE_THRESHOLD")
     if base_threshold is not None:
@@ -1237,11 +1255,11 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
     "bringing_in_wood": lambda env: check_progress(
         env,
         {
-            "robot_near_plywood_1": ("near", "agent.n.01_1", "plywood.n.01_1"),
-            "robot_near_plywood_2": ("near", "agent.n.01_1", "plywood.n.01_2"),
-            "robot_near_plywood_3": ("near", "agent.n.01_1", "plywood.n.01_3"),
-            "robot_near_wood_door": ("near", "agent.n.01_1", "door_vudhlc_1"),
-            "wood_door_opened": ("open_fraction", "door_vudhlc_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "robot_near_plywood_1": _wood_plywood_near_spec("plywood.n.01_1"),
+            "robot_near_plywood_2": _wood_plywood_near_spec("plywood.n.01_2"),
+            "robot_near_plywood_3": _wood_plywood_near_spec("plywood.n.01_3"),
+            "robot_near_wood_door": _wood_door_near_spec(),
+            "wood_door_opened": ("open_fraction", "door_vudhlc_1", _wood_door_open_threshold(), True),
             "robot_in_corridor": ("robot_in_room_of", "agent.n.01_1", "floor.n.01_2"),
             **{
                 f"plywood_{index}_picked_up": (
