@@ -1,5 +1,6 @@
 import os
 
+import omnigibson.utils.transform_utils as T
 import torch as th
 from omnigibson.object_states import (
     ToggledOn,
@@ -36,6 +37,8 @@ BUGS_PICKUP_EEF_THRESHOLD = 0.4
 BUGS_SPRAY_EEF_THRESHOLD = 0.5
 POPCORN_OPEN_EEF_THRESHOLD = 1.0
 POPCORN_OPEN_FRACTION_THRESHOLD = 0.85
+TIDYING_BOOK_EDGE_GAP_THRESHOLD = 0.05
+GROCERIES_TIPPED_UP_DOT_THRESHOLD = 2**-0.5
 
 
 def _near_profile():
@@ -200,6 +203,24 @@ def _popcorn_open_fraction_threshold():
 
 def _task_open_fraction_threshold(env_name):
     return float(os.environ.get(env_name, str(PROGRESS_OPEN_FRACTION_THRESHOLD)))
+
+
+def _tidying_book_edge_gap_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_TIDYING_BOOK_EDGE_GAP_THRESHOLD",
+            str(TIDYING_BOOK_EDGE_GAP_THRESHOLD),
+        )
+    )
+
+
+def _groceries_tipped_up_dot_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_GROCERIES_TIPPED_UP_DOT_THRESHOLD",
+            str(GROCERIES_TIPPED_UP_DOT_THRESHOLD),
+        )
+    )
 
 
 def _debug_task_progress_open():
@@ -505,6 +526,47 @@ def _check_aabb_bottom_above_spec(env, spec):
     return result
 
 
+def _check_object_near_support_edge_spec(env, spec):
+    obj = _resolve_object(env, spec[1])
+    support = _resolve_object(env, spec[2])
+    if not (obj.exists and support.exists):
+        return False
+    obj_lower, obj_upper = obj.unwrapped.aabb
+    support_lower, support_upper = support.unwrapped.aabb
+    obj_center = (obj_lower[:2] + obj_upper[:2]) / 2.0
+    obj_half_extent = (obj_upper[:2] - obj_lower[:2]) / 2.0
+    center_clearance = th.minimum(obj_center - support_lower[:2], support_upper[:2] - obj_center)
+    edge_gap = center_clearance - obj_half_extent
+    min_gap = float(th.min(edge_gap).item())
+    result = min_gap <= float(spec[3])
+    if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_GEOMETRY")):
+        print(
+            "[task_progress_debug_geometry] "
+            f"type=object_near_support_edge obj={spec[1]} support={spec[2]} "
+            f"edge_gap={min_gap} threshold={float(spec[3])} result={result}",
+            flush=True,
+        )
+    return result
+
+
+def _check_object_tipped_spec(env, spec):
+    obj = _resolve_object(env, spec[1])
+    if not obj.exists:
+        return False
+    _, quat = obj.unwrapped.get_position_orientation()
+    local_up_world = T.quat2mat(quat)[:, 2]
+    up_dot = float(th.abs(local_up_world[2]).item())
+    result = up_dot <= float(spec[2])
+    if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_GEOMETRY")):
+        print(
+            "[task_progress_debug_geometry] "
+            f"type=object_tipped obj={spec[1]} up_dot={up_dot} "
+            f"threshold={float(spec[2])} result={result}",
+            flush=True,
+        )
+    return result
+
+
 def _check_composite_spec(env, spec):
     check_type = spec[0]
     if check_type == "state":
@@ -515,6 +577,10 @@ def _check_composite_spec(env, spec):
         return _check_arm_grasping_spec(env, spec)
     if check_type == "aabb_bottom_above":
         return _check_aabb_bottom_above_spec(env, spec)
+    if check_type == "object_near_support_edge":
+        return _check_object_near_support_edge_spec(env, spec)
+    if check_type == "object_tipped":
+        return _check_object_tipped_spec(env, spec)
     if check_type == "all_state":
         return all(_check_composite_spec(env, state_spec) for state_spec in spec[1])
     if check_type == "any_state":
@@ -703,6 +769,14 @@ def check_progress(env, check_specs):
         elif check_type == "aabb_bottom_above":
             # ("aabb_bottom_above", obj_key, reference_key, threshold) checks object clearance above a support.
             results[name] = _check_aabb_bottom_above_spec(env, spec)
+
+        elif check_type == "object_near_support_edge":
+            # Gap from the manipulated object's outer XY edge to the support's outer XY edge.
+            results[name] = _check_object_near_support_edge_spec(env, spec)
+
+        elif check_type == "object_tipped":
+            # Absolute world-Z projection of the object's local up axis; lower means more tilted.
+            results[name] = _check_object_tipped_spec(env, spec)
 
         elif check_type == "open_fraction":
             # ("open_fraction", obj_key, min_fraction, expected_bool) - stricter than symbolic Open
@@ -1241,14 +1315,62 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_car": ("near", "agent.n.01_1", "car.n.01_1"),
+            "robot_near_grocery_door": ("near", "agent.n.01_1", "door_bexenl_0"),
+            "grocery_door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "robot_near_breakfast_table": ("near", "agent.n.01_1", "breakfast_table.n.01_1"),
+            "robot_near_bag": ("near", "agent.n.01_1", "sack.n.01_1"),
+            "robot_near_tomato": ("near", "agent.n.01_1", "beefsteak_tomato.n.01_1"),
+            "robot_near_milk": ("near", "agent.n.01_1", "carton__of__milk.n.01_1"),
             "robot_near_fridge": ("near", "agent.n.01_1", "electric_refrigerator.n.01_1"),
-            "bag_picked_up": ("state", "sack.n.01_1", Inside, "car.n.01_1", False),
+            "bag_picked_up": (
+                "all_state",
+                [
+                    ("state", "sack.n.01_1", Inside, "car.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "sack.n.01_1", True),
+                ],
+            ),
+            "bag_on_table": (
+                "all_state",
+                [
+                    ("state", "sack.n.01_1", OnTop, "breakfast_table.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sack.n.01_1", False),
+                ],
+            ),
+            "bag_tipped": ("object_tipped", "sack.n.01_1", _groceries_tipped_up_dot_threshold()),
             "car_closed": ("state", "car.n.01_1", Open, False),
-            "tomato_out_of_bag": ("state", "beefsteak_tomato.n.01_1", Inside, "sack.n.01_1", False),
-            "milk_out_of_bag": ("state", "carton__of__milk.n.01_1", Inside, "sack.n.01_1", False),
+            "tomato_out_of_bag": (
+                "all_state",
+                [
+                    ("state", "beefsteak_tomato.n.01_1", Inside, "sack.n.01_1", False),
+                    ("grasping", "agent.n.01_1", "beefsteak_tomato.n.01_1", True),
+                ],
+            ),
+            "tomato_grasped_left": ("grasping_arm", "agent.n.01_1", "beefsteak_tomato.n.01_1", "left", True),
+            "tomato_grasped_right": ("grasping_arm", "agent.n.01_1", "beefsteak_tomato.n.01_1", "right", True),
+            "milk_out_of_bag": (
+                "all_state",
+                [
+                    ("state", "carton__of__milk.n.01_1", Inside, "sack.n.01_1", False),
+                    ("state", "carton__of__milk.n.01_1", OnTop, "breakfast_table.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "carton__of__milk.n.01_1", False),
+                ],
+            ),
+            "milk_picked_up": ("grasping", "agent.n.01_1", "carton__of__milk.n.01_1", True),
             "fridge_opened": ("open_fraction", "electric_refrigerator.n.01_1", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
-            "tomato_in_fridge": ("state", "beefsteak_tomato.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
-            "milk_in_fridge": ("state", "carton__of__milk.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
+            "tomato_in_fridge": (
+                "all_state",
+                [
+                    ("state", "beefsteak_tomato.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "beefsteak_tomato.n.01_1", False),
+                ],
+            ),
+            "milk_in_fridge": (
+                "all_state",
+                [
+                    ("state", "carton__of__milk.n.01_1", Inside, "electric_refrigerator.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "carton__of__milk.n.01_1", False),
+                ],
+            ),
             "fridge_closed": ("state", "electric_refrigerator.n.01_1", Open, False),
         },
     ),
@@ -1356,12 +1478,50 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
             "robot_near_bed": ("near", "agent.n.01_1", "bed.n.01_1"),
             "robot_near_table": ("near", "agent.n.01_1", "table.n.02_1"),
-            "book_picked_up": ("state", "book.n.02_1", OnTop, "bed.n.01_1", False),
-            "book_on_table": ("state", "book.n.02_1", OnTop, "table.n.02_1", True),
-            "sandal_1_picked_up": ("state", "sandal.n.01_1", OnTop, "floor.n.01_1", False),
-            "sandal_2_picked_up": ("state", "sandal.n.01_2", OnTop, "floor.n.01_1", False),
-            "sandal_1_near_bed": ("state", "sandal.n.01_1", NextTo, "bed.n.01_1", True),
-            "sandal_2_near_sandal_1": ("state", "sandal.n.01_2", NextTo, "sandal.n.01_1", True),
+            "book_at_bed_edge": (
+                "object_near_support_edge",
+                "book.n.02_1",
+                "bed.n.01_1",
+                _tidying_book_edge_gap_threshold(),
+            ),
+            "book_picked_up": ("grasping", "agent.n.01_1", "book.n.02_1", True),
+            "book_on_table": (
+                "all_state",
+                [
+                    ("state", "book.n.02_1", OnTop, "table.n.02_1", True),
+                    ("grasping", "agent.n.01_1", "book.n.02_1", False),
+                ],
+            ),
+            "sandal_1_picked_up": ("grasping", "agent.n.01_1", "sandal.n.01_1", True),
+            "sandal_2_picked_up": ("grasping", "agent.n.01_1", "sandal.n.01_2", True),
+            "sandal_1_near_bed": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_1", NextTo, "bed.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_1", False),
+                ],
+            ),
+            "sandal_2_near_bed": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_2", NextTo, "bed.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_2", False),
+                ],
+            ),
+            "sandal_2_near_sandal_1": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_2", NextTo, "sandal.n.01_1", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_2", False),
+                ],
+            ),
+            "sandal_1_near_sandal_2": (
+                "all_state",
+                [
+                    ("state", "sandal.n.01_1", NextTo, "sandal.n.01_2", True),
+                    ("grasping", "agent.n.01_1", "sandal.n.01_1", False),
+                ],
+            ),
         },
     ),
     "outfit_a_basic_toolbox": lambda env: check_progress(
