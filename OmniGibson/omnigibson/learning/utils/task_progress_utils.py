@@ -38,9 +38,9 @@ BUGS_SPRAY_EEF_THRESHOLD = 0.5
 POPCORN_OPEN_EEF_THRESHOLD = 1.0
 POPCORN_OPEN_FRACTION_THRESHOLD = 0.85
 TIDYING_BOOK_EDGE_GAP_THRESHOLD = 0.05
-TIDYING_BED_BASE_AABB_THRESHOLD = 0.5
-TIDYING_NIGHTSTAND_BASE_AABB_THRESHOLD = 0.5
-GROCERIES_BREAKFAST_TABLE_BASE_AABB_THRESHOLD = 0.5
+TIDYING_BED_AABB_THRESHOLD = 0.5
+TIDYING_NIGHTSTAND_AABB_THRESHOLD = 0.5
+GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD = 0.5
 GROCERIES_TIPPED_UP_DOT_THRESHOLD = 2**-0.5
 
 
@@ -217,7 +217,7 @@ def _tidying_book_edge_gap_threshold():
     )
 
 
-def _task_base_aabb_threshold(env_name, default_threshold):
+def _task_aabb_threshold(env_name, default_threshold):
     return float(os.environ.get(env_name, str(default_threshold)))
 
 
@@ -607,14 +607,14 @@ def check_progress(env, check_specs):
             "near_threshold",
             "near_eef_threshold",
             "near_base_threshold",
-            "near_base_aabb_threshold",
+            "near_aabb_threshold",
             "near_category_threshold",
         }:
             # ("near", robot_key, obj_key) - robot should always be first.
             # ("near_threshold", robot_key, obj_key, threshold) allows task-local stricter navigation gates.
             # ("near_eef_threshold", robot_key, obj_key, threshold) gates on end-effector distance only.
             # ("near_base_threshold", robot_key, obj_key, threshold) ignores arms/eef for navigation gates.
-            # ("near_base_aabb_threshold", robot_key, obj_key, threshold) measures from base to object footprint.
+            # ("near_aabb_threshold", robot_key, obj_key, threshold) measures base/EEF to object footprint.
             # ("near_category_threshold", robot_key, category_key, threshold) accepts any category instance.
             robot_entity = _resolve_object(env, spec[1])
             obj_entities = (
@@ -627,25 +627,32 @@ def check_progress(env, check_specs):
                 results[name] = False
                 continue
             robot = robot_entity.unwrapped
-            if check_type == "near_base_aabb_threshold":
-                robot_xy = _robot_base_link(robot).get_position_orientation()[0][:2]
+            if check_type == "near_aabb_threshold":
                 threshold = float(spec[3])
                 min_dist = None
                 nearest_obj_name = None
+                nearest_robot_link_name = None
+                robot_links = [_robot_base_link(robot)] + list(robot.eef_links.values())
                 for obj_entity in obj_entities:
                     obj = obj_entity.unwrapped
                     lower, upper = obj.aabb
-                    delta = th.maximum(lower[:2] - robot_xy, robot_xy - upper[:2]).clamp_min(0.0)
-                    dist = float(th.linalg.norm(delta).item())
-                    if min_dist is None or dist < min_dist:
-                        min_dist = dist
-                        nearest_obj_name = getattr(obj, "name", "")
+                    for robot_link in robot_links:
+                        robot_xy = robot_link.get_position_orientation()[0][:2]
+                        delta = th.maximum(lower[:2] - robot_xy, robot_xy - upper[:2]).clamp_min(0.0)
+                        dist = float(th.linalg.norm(delta).item())
+                        if min_dist is None or dist < min_dist:
+                            min_dist = dist
+                            nearest_obj_name = getattr(obj, "name", "")
+                            nearest_robot_link_name = (
+                                "base" if robot_link is _robot_base_link(robot) else getattr(robot_link, "name", "eef")
+                            )
                 results[name] = min_dist is not None and min_dist < threshold
                 if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR")):
                     print(
                         "[task_progress_debug_near] "
                         f"name={name} check_type={check_type} threshold={threshold} "
-                        f"result={results[name]} base_aabb_min={min_dist} nearest_obj={nearest_obj_name}",
+                        f"result={results[name]} aabb_min={min_dist} "
+                        f"nearest_robot_link={nearest_robot_link_name} nearest_obj={nearest_obj_name}",
                         flush=True,
                     )
                 continue
@@ -1355,12 +1362,12 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_grocery_door": ("near", "agent.n.01_1", "door_bexenl_0"),
             "grocery_door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
             "robot_near_breakfast_table": (
-                "near_base_aabb_threshold",
+                "near_aabb_threshold",
                 "agent.n.01_1",
                 "breakfast_table.n.01_1",
-                _task_base_aabb_threshold(
-                    "BEHAVIOR_TASK_PROGRESS_GROCERIES_BREAKFAST_TABLE_BASE_AABB_THRESHOLD",
-                    GROCERIES_BREAKFAST_TABLE_BASE_AABB_THRESHOLD,
+                _task_aabb_threshold(
+                    "BEHAVIOR_TASK_PROGRESS_GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD",
+                    GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD,
                 ),
             ),
             "robot_near_bag": ("near", "agent.n.01_1", "sack.n.01_1"),
@@ -1522,21 +1529,21 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_sandal_1": ("near", "agent.n.01_1", "sandal.n.01_1"),
             "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
             "robot_near_bed": (
-                "near_base_aabb_threshold",
+                "near_aabb_threshold",
                 "agent.n.01_1",
                 "bed.n.01_1",
-                _task_base_aabb_threshold(
-                    "BEHAVIOR_TASK_PROGRESS_TIDYING_BED_BASE_AABB_THRESHOLD",
-                    TIDYING_BED_BASE_AABB_THRESHOLD,
+                _task_aabb_threshold(
+                    "BEHAVIOR_TASK_PROGRESS_TIDYING_BED_AABB_THRESHOLD",
+                    TIDYING_BED_AABB_THRESHOLD,
                 ),
             ),
             "robot_near_table": (
-                "near_base_aabb_threshold",
+                "near_aabb_threshold",
                 "agent.n.01_1",
                 "table.n.02_1",
-                _task_base_aabb_threshold(
-                    "BEHAVIOR_TASK_PROGRESS_TIDYING_NIGHTSTAND_BASE_AABB_THRESHOLD",
-                    TIDYING_NIGHTSTAND_BASE_AABB_THRESHOLD,
+                _task_aabb_threshold(
+                    "BEHAVIOR_TASK_PROGRESS_TIDYING_NIGHTSTAND_AABB_THRESHOLD",
+                    TIDYING_NIGHTSTAND_AABB_THRESHOLD,
                 ),
             ),
             "book_at_bed_edge": (
