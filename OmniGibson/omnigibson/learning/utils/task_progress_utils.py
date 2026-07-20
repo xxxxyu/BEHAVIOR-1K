@@ -1411,6 +1411,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
                     ("grasping", "agent.n.01_1", "sack.n.01_1", False),
                 ],
             ),
+            "bag_released": ("grasping", "agent.n.01_1", "sack.n.01_1", False),
             "bag_tipped": ("object_tipped", "sack.n.01_1", _groceries_tipped_up_dot_threshold()),
             "car_closed": ("state", "car.n.01_1", Open, False),
             "tomato_out_of_bag": (
