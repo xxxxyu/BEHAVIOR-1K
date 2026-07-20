@@ -38,7 +38,7 @@ BUGS_SPRAY_EEF_THRESHOLD = 0.5
 POPCORN_OPEN_EEF_THRESHOLD = 1.0
 POPCORN_OPEN_FRACTION_THRESHOLD = 0.85
 TIDYING_BOOK_EDGE_GAP_THRESHOLD = 0.05
-TIDYING_BED_AABB_THRESHOLD = 0.5
+TIDYING_BED_EEF_AABB_THRESHOLD = 0.3
 TIDYING_NIGHTSTAND_AABB_THRESHOLD = 0.5
 GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD = 0.5
 GROCERIES_TIPPED_UP_DOT_THRESHOLD = 2**-0.5
@@ -618,6 +618,7 @@ def check_progress(env, check_specs):
             "near_eef_threshold",
             "near_base_threshold",
             "near_aabb_threshold",
+            "near_eef_aabb_threshold",
             "near_category_threshold",
         }:
             # ("near", robot_key, obj_key) - robot should always be first.
@@ -625,6 +626,7 @@ def check_progress(env, check_specs):
             # ("near_eef_threshold", robot_key, obj_key, threshold) gates on end-effector distance only.
             # ("near_base_threshold", robot_key, obj_key, threshold) ignores arms/eef for navigation gates.
             # ("near_aabb_threshold", robot_key, obj_key, threshold) measures base/EEF to object footprint.
+            # ("near_eef_aabb_threshold", robot_key, obj_key, threshold) measures EEFs to object footprint.
             # ("near_category_threshold", robot_key, category_key, threshold) accepts any category instance.
             robot_entity = _resolve_object(env, spec[1])
             obj_entities = (
@@ -637,7 +639,7 @@ def check_progress(env, check_specs):
                 results[name] = False
                 continue
             robot = robot_entity.unwrapped
-            if check_type == "near_aabb_threshold":
+            if check_type in {"near_aabb_threshold", "near_eef_aabb_threshold"}:
                 threshold = float(spec[3])
                 min_dist = None
                 nearest_obj_name = None
@@ -645,7 +647,9 @@ def check_progress(env, check_specs):
                 nearest_robot_xy = None
                 nearest_obj_pose = None
                 nearest_obj_aabb = None
-                robot_links = [_robot_base_link(robot)] + list(robot.eef_links.values())
+                robot_links = list(robot.eef_links.values())
+                if check_type == "near_aabb_threshold":
+                    robot_links.insert(0, _robot_base_link(robot))
                 for obj_entity in obj_entities:
                     obj = obj_entity.unwrapped
                     lower, upper = obj.aabb
@@ -1553,12 +1557,12 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
             "robot_near_sandal_1": ("near", "agent.n.01_1", "sandal.n.01_1"),
             "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
             "robot_near_bed": (
-                "near_aabb_threshold",
+                "near_eef_aabb_threshold",
                 "agent.n.01_1",
                 "bed.n.01_1",
                 _task_aabb_threshold(
-                    "BEHAVIOR_TASK_PROGRESS_TIDYING_BED_AABB_THRESHOLD",
-                    TIDYING_BED_AABB_THRESHOLD,
+                    "BEHAVIOR_TASK_PROGRESS_TIDYING_BED_EEF_AABB_THRESHOLD",
+                    TIDYING_BED_EEF_AABB_THRESHOLD,
                 ),
             ),
             "robot_near_table": (
