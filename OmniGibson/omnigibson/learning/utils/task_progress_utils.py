@@ -42,6 +42,7 @@ TIDYING_BED_AABB_THRESHOLD = 0.5
 TIDYING_NIGHTSTAND_AABB_THRESHOLD = 0.5
 GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD = 0.5
 GROCERIES_TIPPED_UP_DOT_THRESHOLD = 2**-0.5
+GROCERIES_DOOR_OPEN_FRACTION_THRESHOLD = MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD
 
 
 def _near_profile():
@@ -226,6 +227,15 @@ def _groceries_tipped_up_dot_threshold():
         os.environ.get(
             "BEHAVIOR_TASK_PROGRESS_GROCERIES_TIPPED_UP_DOT_THRESHOLD",
             str(GROCERIES_TIPPED_UP_DOT_THRESHOLD),
+        )
+    )
+
+
+def _groceries_door_open_threshold():
+    return float(
+        os.environ.get(
+            "BEHAVIOR_TASK_PROGRESS_GROCERIES_DOOR_OPEN_FRACTION",
+            str(GROCERIES_DOOR_OPEN_FRACTION_THRESHOLD),
         )
     )
 
@@ -632,6 +642,9 @@ def check_progress(env, check_specs):
                 min_dist = None
                 nearest_obj_name = None
                 nearest_robot_link_name = None
+                nearest_robot_xy = None
+                nearest_obj_pose = None
+                nearest_obj_aabb = None
                 robot_links = [_robot_base_link(robot)] + list(robot.eef_links.values())
                 for obj_entity in obj_entities:
                     obj = obj_entity.unwrapped
@@ -646,13 +659,23 @@ def check_progress(env, check_specs):
                             nearest_robot_link_name = (
                                 "base" if robot_link is _robot_base_link(robot) else getattr(robot_link, "name", "eef")
                             )
+                            nearest_robot_xy = robot_xy
+                            nearest_obj_pose = obj.get_position_orientation()
+                            nearest_obj_aabb = (lower, upper)
                 results[name] = min_dist is not None and min_dist < threshold
                 if bool(os.environ.get("BEHAVIOR_TASK_PROGRESS_DEBUG_NEAR")):
+                    obj_pos, obj_quat = nearest_obj_pose if nearest_obj_pose is not None else (None, None)
+                    aabb_lower, aabb_upper = nearest_obj_aabb if nearest_obj_aabb is not None else (None, None)
                     print(
                         "[task_progress_debug_near] "
                         f"name={name} check_type={check_type} threshold={threshold} "
                         f"result={results[name]} aabb_min={min_dist} "
-                        f"nearest_robot_link={nearest_robot_link_name} nearest_obj={nearest_obj_name}",
+                        f"nearest_robot_link={nearest_robot_link_name} nearest_obj={nearest_obj_name} "
+                        f"robot_xy={None if nearest_robot_xy is None else [float(v) for v in nearest_robot_xy.tolist()]} "
+                        f"obj_pos={None if obj_pos is None else [float(v) for v in obj_pos.tolist()]} "
+                        f"obj_quat={None if obj_quat is None else [float(v) for v in obj_quat.tolist()]} "
+                        f"aabb_lower={None if aabb_lower is None else [float(v) for v in aabb_lower.tolist()]} "
+                        f"aabb_upper={None if aabb_upper is None else [float(v) for v in aabb_upper.tolist()]}",
                         flush=True,
                     )
                 continue
@@ -1360,7 +1383,7 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         {
             "robot_near_car": ("near", "agent.n.01_1", "car.n.01_1"),
             "robot_near_grocery_door": ("near", "agent.n.01_1", "door_bexenl_0"),
-            "grocery_door_opened": ("open_fraction", "door_bexenl_0", PROGRESS_OPEN_FRACTION_THRESHOLD, True),
+            "grocery_door_opened": ("open_fraction", "door_bexenl_0", _groceries_door_open_threshold(), True),
             "robot_near_breakfast_table": (
                 "near_aabb_threshold",
                 "agent.n.01_1",
