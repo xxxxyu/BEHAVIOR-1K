@@ -174,6 +174,13 @@ def _wood_plywood_near_spec(obj_key):
     )
 
 
+def _tidying_sandal_near_spec(obj_key):
+    return _optional_task_eef_near_spec(
+        "BEHAVIOR_TASK_PROGRESS_TIDYING_SANDAL_PICKUP_EEF_THRESHOLD",
+        obj_key,
+    )
+
+
 def _wood_door_near_spec():
     threshold = os.environ.get("BEHAVIOR_TASK_PROGRESS_WOOD_DOOR_BASE_THRESHOLD")
     if threshold is None:
@@ -1554,8 +1561,8 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_book": ("near", "agent.n.01_1", "book.n.02_1"),
-            "robot_near_sandal_1": ("near", "agent.n.01_1", "sandal.n.01_1"),
-            "robot_near_sandal_2": ("near", "agent.n.01_1", "sandal.n.01_2"),
+            "robot_near_sandal_1": _tidying_sandal_near_spec("sandal.n.01_1"),
+            "robot_near_sandal_2": _tidying_sandal_near_spec("sandal.n.01_2"),
             "robot_near_bed": (
                 "near_eef_aabb_threshold",
                 "agent.n.01_1",
