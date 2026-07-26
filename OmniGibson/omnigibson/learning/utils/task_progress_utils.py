@@ -22,27 +22,77 @@ from omnigibson.object_states import (
 
 ROBOT_OBJECT_DISTANCE_THRESHOLD = 0.5  # meters
 PROGRESS_OPEN_FRACTION_THRESHOLD = 0.5
-MOVING_BOXES_DOOR_DISTANCE_THRESHOLD = 1.2
-MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD = 0.85
-MOVING_BOXES_CONTAINER_EEF_THRESHOLD = 0.4
-MOVING_BOXES_GARAGE_PLACE_X = -2.44
-MOVING_BOXES_GARAGE_PLACE_Y = 3.40
-MOVING_BOXES_GARAGE_PLACE_THRESHOLD = 1.25
+
+# Formal 30/50-rollout-selected defaults. Environment variables below remain
+# explicit ablation overrides; absent an override, evaluation uses this table.
+FORMAL_TASK_PROGRESS_OVERRIDES = {
+    "picking_up_trash": {
+        "pickup_eef_threshold": 0.20,
+    },
+    "moving_boxes_to_storage": {
+        "door_distance_threshold": 1.20,
+        "door_open_fraction_threshold": 0.85,
+        "container_eef_threshold": 0.40,
+        "garage_place_x": -2.44,
+        "garage_place_y": 3.40,
+        "garage_place_threshold": 1.25,
+    },
+    "putting_shoes_on_rack": {
+        "pickup_eef_threshold": 0.20,
+        "hallstand_threshold": 1.00,
+    },
+    "putting_away_Halloween_decorations": {
+        "pickup_eef_threshold": 0.50,
+        "support_eef_threshold": 0.50,
+    },
+    "make_microwave_popcorn": {
+        "open_eef_threshold": 1.00,
+        "open_fraction_threshold": 0.85,
+    },
+    "spraying_for_bugs": {
+        "pickup_eef_threshold": 0.40,
+        "spray_eef_threshold": 0.50,
+    },
+    "tidying_bedroom": {
+        "bed_eef_aabb_threshold": 0.30,
+    },
+    "carrying_in_groceries": {
+        "door_open_fraction_threshold": 0.85,
+    },
+}
+
+_BOXES_DEFAULTS = FORMAL_TASK_PROGRESS_OVERRIDES["moving_boxes_to_storage"]
+MOVING_BOXES_DOOR_DISTANCE_THRESHOLD = _BOXES_DEFAULTS["door_distance_threshold"]
+MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD = _BOXES_DEFAULTS["door_open_fraction_threshold"]
+MOVING_BOXES_CONTAINER_EEF_THRESHOLD = _BOXES_DEFAULTS["container_eef_threshold"]
+MOVING_BOXES_GARAGE_PLACE_X = _BOXES_DEFAULTS["garage_place_x"]
+MOVING_BOXES_GARAGE_PLACE_Y = _BOXES_DEFAULTS["garage_place_y"]
+MOVING_BOXES_GARAGE_PLACE_THRESHOLD = _BOXES_DEFAULTS["garage_place_threshold"]
 HALLOWEEN_CALDRON_LIFT_CLEARANCE_THRESHOLD = 0.08
-HALLOWEEN_PICKUP_EEF_THRESHOLD = 0.5
-HALLOWEEN_SUPPORT_EEF_THRESHOLD = 0.5
-SHOES_PICKUP_EEF_THRESHOLD = 0.2
-SHOES_HALLSTAND_THRESHOLD = 1.0
-BUGS_PICKUP_EEF_THRESHOLD = 0.4
-BUGS_SPRAY_EEF_THRESHOLD = 0.5
-POPCORN_OPEN_EEF_THRESHOLD = 1.0
-POPCORN_OPEN_FRACTION_THRESHOLD = 0.85
+HALLOWEEN_PICKUP_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES[
+    "putting_away_Halloween_decorations"
+]["pickup_eef_threshold"]
+HALLOWEEN_SUPPORT_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES[
+    "putting_away_Halloween_decorations"
+]["support_eef_threshold"]
+SHOES_PICKUP_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["putting_shoes_on_rack"]["pickup_eef_threshold"]
+SHOES_HALLSTAND_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["putting_shoes_on_rack"]["hallstand_threshold"]
+BUGS_PICKUP_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["spraying_for_bugs"]["pickup_eef_threshold"]
+BUGS_SPRAY_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["spraying_for_bugs"]["spray_eef_threshold"]
+POPCORN_OPEN_EEF_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["make_microwave_popcorn"]["open_eef_threshold"]
+POPCORN_OPEN_FRACTION_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["make_microwave_popcorn"][
+    "open_fraction_threshold"
+]
 TIDYING_BOOK_EDGE_GAP_THRESHOLD = 0.05
-TIDYING_BED_EEF_AABB_THRESHOLD = 0.3
+TIDYING_BED_EEF_AABB_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["tidying_bedroom"][
+    "bed_eef_aabb_threshold"
+]
 TIDYING_NIGHTSTAND_AABB_THRESHOLD = 0.5
 GROCERIES_BREAKFAST_TABLE_AABB_THRESHOLD = 0.5
 GROCERIES_TIPPED_UP_DOT_THRESHOLD = 2**-0.5
-GROCERIES_DOOR_OPEN_FRACTION_THRESHOLD = MOVING_BOXES_DOOR_OPEN_FRACTION_THRESHOLD
+GROCERIES_DOOR_OPEN_FRACTION_THRESHOLD = FORMAL_TASK_PROGRESS_OVERRIDES["carrying_in_groceries"][
+    "door_open_fraction_threshold"
+]
 
 
 def _near_profile():
@@ -968,8 +1018,11 @@ def _picking_up_trash_near_threshold(env):
             106: 0.30,
             171: 0.10,
         }
-        return instance_overrides.get(_activity_instance_id(env), 0.20)
-    return 0.20
+        return instance_overrides.get(
+            _activity_instance_id(env),
+            FORMAL_TASK_PROGRESS_OVERRIDES["picking_up_trash"]["pickup_eef_threshold"],
+        )
+    return FORMAL_TASK_PROGRESS_OVERRIDES["picking_up_trash"]["pickup_eef_threshold"]
 
 
 def _picking_up_trash_progress(env):
