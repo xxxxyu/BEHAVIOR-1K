@@ -160,14 +160,14 @@ def render(records):
 :root{{--ink:#17201c;--muted:#65706a;--line:#dfe4e1;--paper:#f7f8f6;--white:#fff;--task:#25745a;--sub:#b85234}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif;letter-spacing:0}}
 header{{position:sticky;top:0;z-index:5;background:rgba(247,248,246,.96);border-bottom:1px solid var(--line);padding:18px 24px}}
-.head{{max-width:1500px;margin:auto;display:flex;gap:20px;align-items:end;justify-content:space-between}}h1{{font-size:22px;margin:0 0 3px}}p{{margin:0;color:var(--muted)}}.controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}select{{min-width:250px;padding:9px 34px 9px 11px;border:1px solid #bfc8c3;border-radius:5px;background:#fff;color:var(--ink)}}
+.head{{max-width:1500px;margin:auto;display:flex;gap:20px;align-items:end;justify-content:space-between}}h1{{font-size:22px;margin:0 0 3px}}p{{margin:0;color:var(--muted)}}.controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}select{{min-width:250px;padding:9px 34px 9px 11px;border:1px solid #bfc8c3;border-radius:5px;background:#fff;color:var(--ink)}}.metrics-link{{color:var(--ink);text-decoration:none;border-bottom:1px solid #9ca7a1;padding:7px 1px 5px}}.metrics-link:hover{{color:var(--task);border-color:var(--task)}}
 .segments{{display:flex;border:1px solid #bfc8c3;border-radius:5px;overflow:hidden;background:#fff}}.segments button{{border:0;border-right:1px solid #d5dcd8;background:#fff;color:var(--muted);padding:9px 11px;cursor:pointer}}.segments button:last-child{{border-right:0}}.segments button.active{{background:var(--ink);color:#fff}}
 main{{max-width:1500px;margin:auto;padding:22px 24px 60px}}.task{{margin:0 0 34px}}h2{{font-size:18px;margin:0 0 10px}}.status{{font-size:12px;color:var(--muted);margin-left:8px;font-weight:400}}
 .pair{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}}.panel{{background:var(--white);border:1px solid var(--line);border-radius:7px;overflow:hidden;min-width:0}}.panel.missing{{display:flex;min-height:260px;align-items:center;justify-content:center;color:var(--muted);background:#fbfcfb}}
 .label{{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}}.mode{{font-weight:650}}.task-only .mode{{color:var(--task)}}.subtask-only .mode{{color:var(--sub)}}video{{display:block;width:100%;background:#101311;aspect-ratio:16/9}}.meta{{padding:9px 12px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}
 .empty{{padding:26px;border:1px dashed #bdc7c1;border-radius:7px;color:var(--muted);background:#fff}}code{{font-family:ui-monospace,SFMono-Regular,monospace;background:#edf0ee;border-radius:3px;padding:1px 4px}}
 @media(max-width:800px){{.head{{display:block}}.controls{{margin-top:12px;justify-content:flex-start}}select{{width:100%}}.pair{{grid-template-columns:1fr}}header,main{{padding-left:14px;padding-right:14px}}}}
-</style></head><body><header><div class="head"><div><h1>Task-only vs subtask-only</h1><p>Checkpoint 399999. Final-contract retained videos; missing formal videos are called out explicitly.</p></div><div class="controls"><div class="segments" aria-label="Comparison coverage"><button class="active" data-scope="all">All</button><button data-scope="paired_tasks">Paired tasks</button><button data-scope="paired_instances">Paired instances</button></div><select id="filter"></select></div></div></header><main id="app"></main>
+</style></head><body><header><div class="head"><div><h1>Task-only vs subtask-only</h1><p>Checkpoint 399999. Final-contract retained videos; missing formal videos are called out explicitly.</p></div><div class="controls"><a class="metrics-link" href="metrics.html">50-rollout metrics</a><div class="segments" aria-label="Comparison coverage"><button class="active" data-scope="all">All</button><button data-scope="paired_tasks">Paired tasks</button><button data-scope="paired_instances">Paired instances</button></div><select id="filter"></select></div></div></header><main id="app"></main>
 <script>
 const tasks={tasks};const rows={payload};const filter=document.querySelector('#filter');
 let scope='all';
@@ -190,6 +190,12 @@ def main():
     records = collect(args.source_root, args.output_root)
     (args.output_root / "manifest.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     (args.output_root / "index.html").write_text(render(records), encoding="utf-8")
+    metrics_source = args.source_root.parents[2] / "docs" / "taskonly_vs_subtask_50rollout_comparison_20260710.html"
+    metrics_link = args.output_root / "metrics.html"
+    if metrics_source.exists():
+        if metrics_link.is_symlink() or metrics_link.exists():
+            metrics_link.unlink()
+        metrics_link.symlink_to(metrics_source.resolve())
     serve_script = args.output_root / "serve.sh"
     serve_script.write_text(
         "#!/usr/bin/env bash\n"
