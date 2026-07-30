@@ -94,7 +94,7 @@ GAPFILL_ROOT = "video_comparison_gapfill399999_20260727"
 
 
 def episode_id(path: Path) -> str:
-    match = re.search(r"_(\d+)_\d+\.mp4$", path.name)
+    match = re.search(r"_(\d+)_\d+(?:_success)?\.mp4$", path.name)
     return match.group(1) if match else path.stem
 
 
