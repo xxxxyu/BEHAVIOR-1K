@@ -2,9 +2,12 @@
 """Build a symlink-only task-only/subtask-only video review gallery."""
 
 import argparse
+import concurrent.futures
 import html
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -139,6 +142,7 @@ def collect(source_root: Path, output_root: Path):
                             "instance": instance,
                             "repeat": repeat_id(source_path),
                             "path": relative.as_posix(),
+                            "version": str(source_path.stat().st_mtime_ns),
                             "source": str(source_path),
                             "note": note,
                         }
@@ -150,8 +154,59 @@ def collect(source_root: Path, output_root: Path):
     return records
 
 
+def generate_posters(records, output_root: Path, *, mode: str, workers: int) -> None:
+    if mode == "off":
+        return
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print("warning: ffmpeg is unavailable; gallery will use lazy video placeholders without posters")
+        return
+
+    def generate(record: dict) -> tuple[dict, str | None]:
+        relative = Path("posters") / record["task"] / record["mode"] / f"instance_{record['instance']}.jpg"
+        destination = output_root / relative
+        source = Path(record["source"])
+        if mode != "refresh" and destination.exists() and destination.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            return record, relative.as_posix()
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "1",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=360:-2",
+            "-q:v",
+            "5",
+            "-y",
+            str(destination),
+        ]
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError:
+            print(f"warning: failed to generate poster for {source}")
+            destination.unlink(missing_ok=True)
+            return record, None
+        return record, relative.as_posix()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        for record, poster in executor.map(generate, records):
+            if poster is not None:
+                record["poster"] = poster
+
+
 def render(records):
-    payload = json.dumps(records, ensure_ascii=True)
+    browser_fields = ("task", "mode", "instance", "repeat", "path", "poster", "version", "note")
+    browser_records = [{key: record[key] for key in browser_fields if key in record} for record in records]
+    payload = json.dumps(browser_records, ensure_ascii=True)
     tasks = json.dumps([{"key": key, "name": name} for key, name in TASKS])
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -163,19 +218,29 @@ header{{position:sticky;top:0;z-index:5;background:rgba(247,248,246,.96);border-
 .head{{max-width:1500px;margin:auto;display:flex;gap:20px;align-items:end;justify-content:space-between}}h1{{font-size:22px;margin:0 0 3px}}p{{margin:0;color:var(--muted)}}.controls{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}select{{min-width:250px;padding:9px 34px 9px 11px;border:1px solid #bfc8c3;border-radius:5px;background:#fff;color:var(--ink)}}.metrics-link{{color:var(--ink);text-decoration:none;border-bottom:1px solid #9ca7a1;padding:7px 1px 5px}}.metrics-link:hover{{color:var(--task);border-color:var(--task)}}
 .segments{{display:flex;border:1px solid #bfc8c3;border-radius:5px;overflow:hidden;background:#fff}}.segments button{{border:0;border-right:1px solid #d5dcd8;background:#fff;color:var(--muted);padding:9px 11px;cursor:pointer}}.segments button:last-child{{border-right:0}}.segments button.active{{background:var(--ink);color:#fff}}
 main{{max-width:1500px;margin:auto;padding:22px 24px 60px}}.task{{margin:0 0 34px}}h2{{font-size:18px;margin:0 0 10px}}.status{{font-size:12px;color:var(--muted);margin-left:8px;font-weight:400}}
-.pair{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}}.panel{{background:var(--white);border:1px solid var(--line);border-radius:7px;overflow:hidden;min-width:0}}.panel.missing{{display:flex;min-height:260px;align-items:center;justify-content:center;color:var(--muted);background:#fbfcfb}}
-.label{{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}}.mode{{font-weight:650}}.task-only .mode{{color:var(--task)}}.subtask-only .mode{{color:var(--sub)}}video{{display:block;width:100%;background:#101311;aspect-ratio:16/9}}.meta{{padding:9px 12px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}
+	.task{{border-bottom:1px solid var(--line);margin:0 0 12px;padding:0 0 12px}}.task summary{{cursor:pointer;list-style:none;display:flex;align-items:center;gap:9px;padding:8px 0}}.task summary h2{{margin:0}}.task summary::-webkit-details-marker{{display:none}}.task summary::before{{content:'';width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .16s ease;margin-left:2px}}.task[open] summary::before{{transform:rotate(45deg)}}.task-body{{padding-top:2px}}
+	.pair{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;content-visibility:auto;contain-intrinsic-size:760px 450px}}.panel{{background:var(--white);border:1px solid var(--line);border-radius:7px;overflow:hidden;min-width:0}}.panel.missing{{display:flex;min-height:260px;align-items:center;justify-content:center;color:var(--muted);background:#fbfcfb}}
+	.label{{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}}.mode{{font-weight:650}}.task-only .mode{{color:var(--task)}}.subtask-only .mode{{color:var(--sub)}}.media-shell{{position:relative;background:#101311;aspect-ratio:16/9;overflow:hidden}}video{{display:block;width:100%;height:100%;object-fit:contain;background:#101311}}.load-video{{position:absolute;inset:0;margin:auto;width:52px;height:52px;border:1px solid rgba(255,255,255,.72);border-radius:50%;background:rgba(12,16,14,.78);cursor:pointer;box-shadow:0 3px 18px rgba(0,0,0,.28)}}.load-video::after{{content:'';display:block;margin-left:18px;border-top:8px solid transparent;border-bottom:8px solid transparent;border-left:13px solid #fff}}.load-video:hover{{background:rgba(37,116,90,.92)}}.meta{{padding:9px 12px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}
 .empty{{padding:26px;border:1px dashed #bdc7c1;border-radius:7px;color:var(--muted);background:#fff}}code{{font-family:ui-monospace,SFMono-Regular,monospace;background:#edf0ee;border-radius:3px;padding:1px 4px}}
 @media(max-width:800px){{.head{{display:block}}.controls{{margin-top:12px;justify-content:flex-start}}select{{width:100%}}.pair{{grid-template-columns:1fr}}header,main{{padding-left:14px;padding-right:14px}}}}
 </style></head><body><header><div class="head"><div><h1>Task-only vs subtask-only</h1><p>Checkpoint 399999. Final-contract retained videos; missing formal videos are called out explicitly.</p></div><div class="controls"><a class="metrics-link" href="metrics.html">50-rollout metrics</a><div class="segments" aria-label="Comparison coverage"><button class="active" data-scope="all">All</button><button data-scope="paired_tasks">Paired tasks</button><button data-scope="paired_instances">Paired instances</button></div><select id="filter"></select></div></div></header><main id="app"></main>
-<script>
-const tasks={tasks};const rows={payload};const filter=document.querySelector('#filter');
-let scope='all';
-filter.innerHTML='<option value="all">All tasks</option>'+tasks.map(t=>`<option value="${{t.key}}">${{t.name}}</option>`).join('');
-const esc=s=>String(s).replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
-function panel(row,mode){{if(!row)return `<div class="panel missing">No retained final-contract ${{mode.replace('_','-')}} video</div>`;return `<article class="panel ${{mode.replace('_','-')}}"><div class="label"><span class="mode">${{mode.replace('_','-')}}</span><span>instance ${{esc(row.instance)}} · repeat ${{esc(row.repeat)}}</span></div><video controls preload="metadata" src="${{esc(row.path)}}"></video><div class="meta">${{esc(row.note)}}</div></article>`}}
-function taskData(t){{const rr=rows.filter(r=>r.task===t.key);const byMode={{task_only:new Map(),subtask_only:new Map()}};rr.forEach(r=>byMode[r.mode].set(r.instance,r));const allIds=[...new Set(rr.map(r=>r.instance))].sort((a,b)=>Number(a)-Number(b));const pairedIds=allIds.filter(id=>byMode.task_only.has(id)&&byMode.subtask_only.has(id));return {{t,byMode,allIds,pairedIds}}}}
-function render(){{const chosen=filter.value;const visible=tasks.map(taskData).filter(d=>(chosen==='all'||d.t.key===chosen)&&(scope==='all'||(scope==='paired_tasks'&&d.byMode.task_only.size&&d.byMode.subtask_only.size)||(scope==='paired_instances'&&d.pairedIds.length)));document.querySelector('#app').innerHTML=visible.map(d=>{{const ids=scope==='paired_instances'?d.pairedIds:d.allIds;const body=ids.length?ids.map(id=>`<div class="pair">${{panel(d.byMode.task_only.get(id),'task_only')}}${{panel(d.byMode.subtask_only.get(id),'subtask_only')}}</div>`).join(''):'<div class="empty">No retained final-contract videos. The formal evaluation used <code>--minimal-output</code>.</div>';return `<section class="task"><h2>${{d.t.name}}<span class="status">${{d.byMode.task_only.size}} task-only · ${{d.byMode.subtask_only.size}} subtask-only · ${{d.pairedIds.length}} paired</span></h2>${{body}}</section>`}}).join('')||'<div class="empty">No comparisons match this filter yet.</div>';document.querySelectorAll('video').forEach(v=>v.addEventListener('play',()=>document.querySelectorAll('video').forEach(o=>{{if(o!==v)o.pause()}})))}}
+	<script>
+	const tasks={tasks};const rows={payload};const filter=document.querySelector('#filter');
+	let scope='all';const expanded=new Set();
+	filter.innerHTML='<option value="all">All tasks</option>'+tasks.map(t=>`<option value="${{t.key}}">${{t.name}}</option>`).join('');
+	const esc=s=>String(s).replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+	function versioned(path,row){{return `${{path}}?v=${{encodeURIComponent(row.version||'1')}}`}}
+	function panel(row,mode){{if(!row)return `<div class="panel missing">No retained final-contract ${{mode.replace('_','-')}} video</div>`;const poster=row.poster?` data-poster="${{esc(versioned(row.poster,row))}}"`:'';return `<article class="panel ${{mode.replace('_','-')}}"><div class="label"><span class="mode">${{mode.replace('_','-')}}</span><span>instance ${{esc(row.instance)}} · repeat ${{esc(row.repeat)}}</span></div><div class="media-shell"><video controls preload="none" data-src="${{esc(versioned(row.path,row))}}"${{poster}}></video><button class="load-video" type="button" title="Play video" aria-label="Play video"></button></div><div class="meta">${{esc(row.note)}}</div></article>`}}
+	function taskData(t){{const rr=rows.filter(r=>r.task===t.key);const byMode={{task_only:new Map(),subtask_only:new Map()}};rr.forEach(r=>byMode[r.mode].set(r.instance,r));const allIds=[...new Set(rr.map(r=>r.instance))].sort((a,b)=>Number(a)-Number(b));const pairedIds=allIds.filter(id=>byMode.task_only.has(id)&&byMode.subtask_only.has(id));return {{t,byMode,allIds,pairedIds}}}}
+	function idsFor(d){{return scope==='paired_instances'?d.pairedIds:d.allIds}}
+	function taskBody(d){{const ids=idsFor(d);return ids.length?ids.map(id=>`<div class="pair">${{panel(d.byMode.task_only.get(id),'task_only')}}${{panel(d.byMode.subtask_only.get(id),'subtask_only')}}</div>`).join(''):'<div class="empty">No retained final-contract videos. The formal evaluation used <code>--minimal-output</code>.</div>'}}
+	function pauseOthers(active){{document.querySelectorAll('video').forEach(video=>{{if(video!==active&&!video.paused)video.pause()}})}}
+	function activate(video){{if(!video.src){{video.src=video.dataset.src;video.preload='metadata';video.load()}}const button=video.parentElement.querySelector('.load-video');if(button)button.remove();pauseOthers(video);video.play().catch(()=>{{}})}}
+	function prepareMedia(root){{const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{{if(!entry.isIntersecting)return;const video=entry.target.querySelector('video');if(video.dataset.poster&&!video.poster)video.poster=video.dataset.poster;observer.unobserve(entry.target)}}),{{rootMargin:'500px 0px'}});root.querySelectorAll('.media-shell').forEach(shell=>{{observer.observe(shell);const video=shell.querySelector('video');shell.querySelector('.load-video').addEventListener('click',()=>activate(video));video.addEventListener('play',()=>pauseOthers(video))}})}}
+	function mountTask(details,d){{const body=details.querySelector('.task-body');if(body.dataset.mounted==='1')return;body.innerHTML=taskBody(d);body.dataset.mounted='1';prepareMedia(body)}}
+	function unmountTask(details){{const body=details.querySelector('.task-body');body.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}});body.replaceChildren();body.dataset.mounted='0'}}
+	function unloadVideos(){{document.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}})}}
+	function render(){{unloadVideos();const chosen=filter.value;const visible=tasks.map(taskData).filter(d=>(chosen==='all'||d.t.key===chosen)&&(scope==='all'||(scope==='paired_tasks'&&d.byMode.task_only.size&&d.byMode.subtask_only.size)||(scope==='paired_instances'&&d.pairedIds.length)));if(chosen!=='all')expanded.add(chosen);else if(!expanded.size&&visible.length)expanded.add(visible[0].t.key);document.querySelector('#app').innerHTML=visible.map(d=>`<details class="task" data-task="${{d.t.key}}" ${{expanded.has(d.t.key)?'open':''}}><summary><h2>${{d.t.name}}<span class="status">${{d.byMode.task_only.size}} task-only · ${{d.byMode.subtask_only.size}} subtask-only · ${{d.pairedIds.length}} paired</span></h2></summary><div class="task-body"></div></details>`).join('')||'<div class="empty">No comparisons match this filter yet.</div>';document.querySelectorAll('details.task').forEach(details=>{{const d=visible.find(item=>item.t.key===details.dataset.task);details.addEventListener('toggle',()=>{{if(details.open){{expanded.add(d.t.key);mountTask(details,d)}}else{{expanded.delete(d.t.key);unmountTask(details)}}}});if(details.open)mountTask(details,d)}})}}
 document.querySelectorAll('[data-scope]').forEach(button=>button.addEventListener('click',()=>{{scope=button.dataset.scope;document.querySelectorAll('[data-scope]').forEach(b=>b.classList.toggle('active',b===button));render()}}));
 filter.addEventListener('change',render);render();
 </script></body></html>"""
@@ -185,9 +250,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--poster-mode", choices=("auto", "off", "refresh"), default="auto")
+    parser.add_argument("--poster-workers", type=int, default=4)
     args = parser.parse_args()
     args.output_root.mkdir(parents=True, exist_ok=True)
     records = collect(args.source_root, args.output_root)
+    generate_posters(records, args.output_root, mode=args.poster_mode, workers=args.poster_workers)
     (args.output_root / "manifest.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     (args.output_root / "index.html").write_text(render(records), encoding="utf-8")
     metrics_source = args.source_root.parents[2] / "docs" / "taskonly_vs_subtask_50rollout_comparison_20260710.html"
@@ -201,7 +269,9 @@ def main():
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "port=${1:-18080}\n"
-        'exec python3 -m http.server "$port" --bind 127.0.0.1\n',
+        'root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+        f'server={str((args.source_root.parents[1] / "OmniGibson/scripts/serve_policy_comparison_gallery.py").resolve())!r}\n'
+        'exec python3 "$server" --root "$root" --port "$port" --bind 127.0.0.1\n',
         encoding="utf-8",
     )
     serve_script.chmod(0o755)
