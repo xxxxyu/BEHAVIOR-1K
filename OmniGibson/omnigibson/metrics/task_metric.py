@@ -1,4 +1,3 @@
-import numpy as np
 import omnigibson as og
 from omnigibson.metrics.metric_base import MetricBase
 from typing import Optional
@@ -50,6 +49,6 @@ class TaskMetric(MetricBase):
             "time": {
                 "simulator_steps": self.timesteps,
                 "simulator_time": self.timesteps * self.render_timestep,
-                "normalized_time": self.human_stats["steps"] / self.timesteps,
+                "normalized_time": self.human_stats["steps"] / self.timesteps if self.timesteps else float("inf"),
             },
         }
