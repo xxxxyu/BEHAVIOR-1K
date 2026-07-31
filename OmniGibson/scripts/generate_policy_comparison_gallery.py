@@ -3,7 +3,6 @@
 
 import argparse
 import concurrent.futures
-import html
 import json
 import re
 import shutil
@@ -203,11 +202,34 @@ def generate_posters(records, output_root: Path, *, mode: str, workers: int) -> 
                 record["poster"] = poster
 
 
-def render(records):
+def write_browser_data(records, output_root: Path) -> list[dict]:
     browser_fields = ("task", "mode", "instance", "repeat", "path", "poster", "version", "note")
-    browser_records = [{key: record[key] for key in browser_fields if key in record} for record in records]
-    payload = json.dumps(browser_records, ensure_ascii=True)
-    tasks = json.dumps([{"key": key, "name": name} for key, name in TASKS])
+    data_root = output_root / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    task_summaries = []
+    for task_key, task_name in TASKS:
+        task_records = [record for record in records if record["task"] == task_key]
+        browser_records = [{key: record[key] for key in browser_fields if key in record} for record in task_records]
+        data_path = data_root / f"{task_key}.json"
+        data_path.write_text(json.dumps(browser_records, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
+        task_ids = {record["instance"] for record in task_records if record["mode"] == "task_only"}
+        subtask_ids = {record["instance"] for record in task_records if record["mode"] == "subtask_only"}
+        version = max((int(record["version"]) for record in task_records), default=1)
+        task_summaries.append(
+            {
+                "key": task_key,
+                "name": task_name,
+                "task_only": len(task_ids),
+                "subtask_only": len(subtask_ids),
+                "paired": len(task_ids & subtask_ids),
+                "data": f"data/{task_key}.json?v={version}",
+            }
+        )
+    return task_summaries
+
+
+def render(task_summaries):
+    tasks = json.dumps(task_summaries, ensure_ascii=True, separators=(",", ":"))
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Task-only vs subtask-only video review</title>
@@ -220,29 +242,30 @@ header{{position:sticky;top:0;z-index:5;background:rgba(247,248,246,.96);border-
 main{{max-width:1500px;margin:auto;padding:22px 24px 60px}}.task{{margin:0 0 34px}}h2{{font-size:18px;margin:0 0 10px}}.status{{font-size:12px;color:var(--muted);margin-left:8px;font-weight:400}}
 	.task{{border-bottom:1px solid var(--line);margin:0 0 12px;padding:0 0 12px}}.task summary{{cursor:pointer;list-style:none;display:flex;align-items:center;gap:9px;padding:8px 0}}.task summary h2{{margin:0}}.task summary::-webkit-details-marker{{display:none}}.task summary::before{{content:'';width:8px;height:8px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .16s ease;margin-left:2px}}.task[open] summary::before{{transform:rotate(45deg)}}.task-body{{padding-top:2px}}
 	.pair{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px;content-visibility:auto;contain-intrinsic-size:760px 450px}}.panel{{background:var(--white);border:1px solid var(--line);border-radius:7px;overflow:hidden;min-width:0}}.panel.missing{{display:flex;min-height:260px;align-items:center;justify-content:center;color:var(--muted);background:#fbfcfb}}
-	.label{{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}}.mode{{font-weight:650}}.task-only .mode{{color:var(--task)}}.subtask-only .mode{{color:var(--sub)}}.media-shell{{position:relative;background:#101311;aspect-ratio:16/9;overflow:hidden}}video{{display:block;width:100%;height:100%;object-fit:contain;background:#101311}}.load-video{{position:absolute;inset:0;margin:auto;width:52px;height:52px;border:1px solid rgba(255,255,255,.72);border-radius:50%;background:rgba(12,16,14,.78);cursor:pointer;box-shadow:0 3px 18px rgba(0,0,0,.28)}}.load-video::after{{content:'';display:block;margin-left:18px;border-top:8px solid transparent;border-bottom:8px solid transparent;border-left:13px solid #fff}}.load-video:hover{{background:rgba(37,116,90,.92)}}.meta{{padding:9px 12px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}
+		.label{{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px}}.mode{{font-weight:650}}.task-only .mode{{color:var(--task)}}.subtask-only .mode{{color:var(--sub)}}.media-shell{{position:relative;background:#101311;aspect-ratio:16/9;overflow:hidden}}.poster,video{{display:block;width:100%;height:100%;object-fit:contain;background:#101311}}.poster-missing{{width:100%;height:100%;background:#151a17}}.load-video{{position:absolute;inset:0;margin:auto;width:52px;height:52px;border:1px solid rgba(255,255,255,.72);border-radius:50%;background:rgba(12,16,14,.78);cursor:pointer;box-shadow:0 3px 18px rgba(0,0,0,.28)}}.load-video::after{{content:'';display:block;margin-left:18px;border-top:8px solid transparent;border-bottom:8px solid transparent;border-left:13px solid #fff}}.load-video:hover{{background:rgba(37,116,90,.92)}}.meta{{padding:9px 12px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}}
 .empty{{padding:26px;border:1px dashed #bdc7c1;border-radius:7px;color:var(--muted);background:#fff}}code{{font-family:ui-monospace,SFMono-Regular,monospace;background:#edf0ee;border-radius:3px;padding:1px 4px}}
 @media(max-width:800px){{.head{{display:block}}.controls{{margin-top:12px;justify-content:flex-start}}select{{width:100%}}.pair{{grid-template-columns:1fr}}header,main{{padding-left:14px;padding-right:14px}}}}
 </style></head><body><header><div class="head"><div><h1>Task-only vs subtask-only</h1><p>Checkpoint 399999. Final-contract retained videos; missing formal videos are called out explicitly.</p></div><div class="controls"><a class="metrics-link" href="metrics.html">50-rollout metrics</a><div class="segments" aria-label="Comparison coverage"><button class="active" data-scope="all">All</button><button data-scope="paired_tasks">Paired tasks</button><button data-scope="paired_instances">Paired instances</button></div><select id="filter"></select></div></div></header><main id="app"></main>
 	<script>
-	const tasks={tasks};const rows={payload};const filter=document.querySelector('#filter');
-	let scope='all';const expanded=new Set();
-	filter.innerHTML='<option value="all">All tasks</option>'+tasks.map(t=>`<option value="${{t.key}}">${{t.name}}</option>`).join('');
-	const esc=s=>String(s).replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
-	function versioned(path,row){{return `${{path}}?v=${{encodeURIComponent(row.version||'1')}}`}}
-	function panel(row,mode){{if(!row)return `<div class="panel missing">No retained final-contract ${{mode.replace('_','-')}} video</div>`;const poster=row.poster?` data-poster="${{esc(versioned(row.poster,row))}}"`:'';return `<article class="panel ${{mode.replace('_','-')}}"><div class="label"><span class="mode">${{mode.replace('_','-')}}</span><span>instance ${{esc(row.instance)}} · repeat ${{esc(row.repeat)}}</span></div><div class="media-shell"><video controls preload="none" data-src="${{esc(versioned(row.path,row))}}"${{poster}}></video><button class="load-video" type="button" title="Play video" aria-label="Play video"></button></div><div class="meta">${{esc(row.note)}}</div></article>`}}
-	function taskData(t){{const rr=rows.filter(r=>r.task===t.key);const byMode={{task_only:new Map(),subtask_only:new Map()}};rr.forEach(r=>byMode[r.mode].set(r.instance,r));const allIds=[...new Set(rr.map(r=>r.instance))].sort((a,b)=>Number(a)-Number(b));const pairedIds=allIds.filter(id=>byMode.task_only.has(id)&&byMode.subtask_only.has(id));return {{t,byMode,allIds,pairedIds}}}}
-	function idsFor(d){{return scope==='paired_instances'?d.pairedIds:d.allIds}}
-	function taskBody(d){{const ids=idsFor(d);return ids.length?ids.map(id=>`<div class="pair">${{panel(d.byMode.task_only.get(id),'task_only')}}${{panel(d.byMode.subtask_only.get(id),'subtask_only')}}</div>`).join(''):'<div class="empty">No retained final-contract videos. The formal evaluation used <code>--minimal-output</code>.</div>'}}
-	function pauseOthers(active){{document.querySelectorAll('video').forEach(video=>{{if(video!==active&&!video.paused)video.pause()}})}}
-	function activate(video){{if(!video.src){{video.src=video.dataset.src;video.preload='metadata';video.load()}}const button=video.parentElement.querySelector('.load-video');if(button)button.remove();pauseOthers(video);video.play().catch(()=>{{}})}}
-	function prepareMedia(root){{const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{{if(!entry.isIntersecting)return;const video=entry.target.querySelector('video');if(video.dataset.poster&&!video.poster)video.poster=video.dataset.poster;observer.unobserve(entry.target)}}),{{rootMargin:'500px 0px'}});root.querySelectorAll('.media-shell').forEach(shell=>{{observer.observe(shell);const video=shell.querySelector('video');shell.querySelector('.load-video').addEventListener('click',()=>activate(video));video.addEventListener('play',()=>pauseOthers(video))}})}}
-	function mountTask(details,d){{const body=details.querySelector('.task-body');if(body.dataset.mounted==='1')return;body.innerHTML=taskBody(d);body.dataset.mounted='1';prepareMedia(body)}}
-	function unmountTask(details){{const body=details.querySelector('.task-body');body.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}});body.replaceChildren();body.dataset.mounted='0'}}
-	function unloadVideos(){{document.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}})}}
-	function render(){{unloadVideos();const chosen=filter.value;const visible=tasks.map(taskData).filter(d=>(chosen==='all'||d.t.key===chosen)&&(scope==='all'||(scope==='paired_tasks'&&d.byMode.task_only.size&&d.byMode.subtask_only.size)||(scope==='paired_instances'&&d.pairedIds.length)));if(chosen!=='all')expanded.add(chosen);else if(!expanded.size&&visible.length)expanded.add(visible[0].t.key);document.querySelector('#app').innerHTML=visible.map(d=>`<details class="task" data-task="${{d.t.key}}" ${{expanded.has(d.t.key)?'open':''}}><summary><h2>${{d.t.name}}<span class="status">${{d.byMode.task_only.size}} task-only · ${{d.byMode.subtask_only.size}} subtask-only · ${{d.pairedIds.length}} paired</span></h2></summary><div class="task-body"></div></details>`).join('')||'<div class="empty">No comparisons match this filter yet.</div>';document.querySelectorAll('details.task').forEach(details=>{{const d=visible.find(item=>item.t.key===details.dataset.task);details.addEventListener('toggle',()=>{{if(details.open){{expanded.add(d.t.key);mountTask(details,d)}}else{{expanded.delete(d.t.key);unmountTask(details)}}}});if(details.open)mountTask(details,d)}})}}
-document.querySelectorAll('[data-scope]').forEach(button=>button.addEventListener('click',()=>{{scope=button.dataset.scope;document.querySelectorAll('[data-scope]').forEach(b=>b.classList.toggle('active',b===button));render()}}));
-filter.addEventListener('change',render);render();
+		const tasks={tasks};const filter=document.querySelector('#filter');
+		let scope='all';const expanded=new Set();const taskCache=new Map();
+		filter.innerHTML='<option value="all">All tasks</option>'+tasks.map(t=>`<option value="${{t.key}}">${{t.name}}</option>`).join('');
+		const esc=s=>String(s).replace(/[&<>\"]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+		function versioned(path,row){{return `${{path}}?v=${{encodeURIComponent(row.version||'1')}}`}}
+		function panel(row,mode){{if(!row)return `<div class="panel missing">No retained final-contract ${{mode.replace('_','-')}} video</div>`;const poster=row.poster?versioned(row.poster,row):'';const preview=poster?`<img class="poster" loading="lazy" decoding="async" src="${{esc(poster)}}" alt="">`:'<div class="poster-missing"></div>';return `<article class="panel ${{mode.replace('_','-')}}"><div class="label"><span class="mode">${{mode.replace('_','-')}}</span><span>instance ${{esc(row.instance)}} · repeat ${{esc(row.repeat)}}</span></div><div class="media-shell">${{preview}}<button class="load-video" type="button" title="Play video" aria-label="Play video" data-src="${{esc(versioned(row.path,row))}}" data-poster="${{esc(poster)}}"></button></div><div class="meta">${{esc(row.note)}}</div></article>`}}
+		function indexTask(t,rows){{const byMode={{task_only:new Map(),subtask_only:new Map()}};rows.forEach(row=>byMode[row.mode].set(row.instance,row));const allIds=[...new Set(rows.map(row=>row.instance))].sort((a,b)=>Number(a)-Number(b));const pairedIds=allIds.filter(id=>byMode.task_only.has(id)&&byMode.subtask_only.has(id));return {{t,byMode,allIds,pairedIds}}}}
+		async function loadTask(t){{if(!taskCache.has(t.key))taskCache.set(t.key,fetch(t.data,{{cache:'no-cache'}}).then(response=>{{if(!response.ok)throw new Error(`HTTP ${{response.status}}`);return response.json()}}).then(rows=>indexTask(t,rows)));return taskCache.get(t.key)}}
+		function idsFor(d){{return scope==='paired_instances'?d.pairedIds:d.allIds}}
+		function taskBody(d){{const ids=idsFor(d);return ids.length?ids.map(id=>`<div class="pair">${{panel(d.byMode.task_only.get(id),'task_only')}}${{panel(d.byMode.subtask_only.get(id),'subtask_only')}}</div>`).join(''):'<div class="empty">No retained final-contract videos. The formal evaluation used <code>--minimal-output</code>.</div>'}}
+		function pauseOthers(active){{document.querySelectorAll('video').forEach(video=>{{if(video!==active&&!video.paused)video.pause()}})}}
+		function activate(button){{const shell=button.parentElement;const video=document.createElement('video');video.controls=true;video.preload='metadata';video.src=button.dataset.src;if(button.dataset.poster)video.poster=button.dataset.poster;video.addEventListener('play',()=>pauseOthers(video));shell.replaceChildren(video);pauseOthers(video);video.play().catch(()=>{{}})}}
+		function prepareMedia(root){{root.querySelectorAll('.load-video').forEach(button=>button.addEventListener('click',()=>activate(button)))}}
+		async function mountTask(details,t){{const body=details.querySelector('.task-body');if(body.dataset.mounted==='1'||body.dataset.loading==='1')return;body.dataset.loading='1';body.innerHTML='<div class="empty">Loading task videos...</div>';try{{const d=await loadTask(t);if(!details.isConnected||!details.open)return;body.innerHTML=taskBody(d);body.dataset.mounted='1';prepareMedia(body)}}catch(error){{if(details.isConnected&&details.open)body.innerHTML=`<div class="empty">Unable to load task videos: ${{esc(error.message)}}</div>`}}finally{{body.dataset.loading='0'}}}}
+		function unmountTask(details){{const body=details.querySelector('.task-body');body.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}});body.replaceChildren();body.dataset.mounted='0';body.dataset.loading='0'}}
+		function unloadVideos(){{document.querySelectorAll('video').forEach(video=>{{video.pause();video.removeAttribute('src');video.load()}})}}
+		function render(){{unloadVideos();const chosen=filter.value;const visible=tasks.filter(t=>(chosen==='all'||t.key===chosen)&&(scope==='all'||(scope==='paired_tasks'&&t.task_only&&t.subtask_only)||(scope==='paired_instances'&&t.paired)));document.querySelector('#app').innerHTML=visible.map(t=>`<details class="task" data-task="${{t.key}}" ${{expanded.has(t.key)?'open':''}}><summary><h2>${{t.name}}<span class="status">${{t.task_only}} task-only · ${{t.subtask_only}} subtask-only · ${{t.paired}} paired</span></h2></summary><div class="task-body"></div></details>`).join('')||'<div class="empty">No comparisons match this filter yet.</div>';document.querySelectorAll('details.task').forEach(details=>{{const t=visible.find(item=>item.key===details.dataset.task);details.addEventListener('toggle',()=>{{if(details.open){{expanded.add(t.key);mountTask(details,t)}}else{{expanded.delete(t.key);unmountTask(details)}}}});if(details.open)mountTask(details,t)}})}}
+	document.querySelectorAll('[data-scope]').forEach(button=>button.addEventListener('click',()=>{{scope=button.dataset.scope;document.querySelectorAll('[data-scope]').forEach(b=>b.classList.toggle('active',b===button));render()}}));
+	filter.addEventListener('change',()=>{{expanded.clear();if(filter.value!=='all')expanded.add(filter.value);render()}});render();
 </script></body></html>"""
 
 
@@ -257,7 +280,8 @@ def main():
     records = collect(args.source_root, args.output_root)
     generate_posters(records, args.output_root, mode=args.poster_mode, workers=args.poster_workers)
     (args.output_root / "manifest.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
-    (args.output_root / "index.html").write_text(render(records), encoding="utf-8")
+    task_summaries = write_browser_data(records, args.output_root)
+    (args.output_root / "index.html").write_text(render(task_summaries), encoding="utf-8")
     metrics_source = args.source_root.parents[2] / "docs" / "taskonly_vs_subtask_50rollout_comparison_20260710.html"
     metrics_link = args.output_root / "metrics.html"
     if metrics_source.exists():
