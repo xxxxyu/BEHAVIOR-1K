@@ -40,7 +40,7 @@ import websockets.asyncio.server as websocket_server
 
 
 logger = logging.getLogger(__name__)
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 def _no_op_action(robot: object) -> np.ndarray:
@@ -95,6 +95,8 @@ class AgenticEvaluatorRuntime:
         self.truncated = False
         self.finished = False
         self._metrics_finished = False
+        self._last_metrics: dict[str, object] | None = None
+        self.attempt_index = 0
 
         self.robot = self.evaluator.robot
         self.controller_manifest = build_controller_manifest(self.robot, simulator=og.sim)
@@ -112,7 +114,15 @@ class AgenticEvaluatorRuntime:
         runtime_component = AttributeSnapshotComponent(
             name="agentic_runtime",
             owner=self,
-            attributes=("last_reward", "last_info", "terminated", "truncated", "finished", "_metrics_finished"),
+            attributes=(
+                "last_reward",
+                "last_info",
+                "terminated",
+                "truncated",
+                "finished",
+                "_metrics_finished",
+                "_last_metrics",
+            ),
         )
         manager = CompositeSnapshotManager(
             simulator=og.sim,
@@ -127,6 +137,20 @@ class AgenticEvaluatorRuntime:
             controller_manifest=self.controller_manifest,
             snapshot_manager=manager,
         )
+        self.session.pause()
+        try:
+            self.initial_snapshot = self.session.snapshot(
+                task_name=self.task_name,
+                instance_id=str(self.instance_id),
+                episode_id=self.episode_id,
+            )
+            self.snapshots[self.initial_snapshot.snapshot_id] = self.initial_snapshot
+            # Attempt zero and every retry begin from the same documented
+            # post-restore propagation semantics.
+            self.initial_restore_report = self.session.restore(self.initial_snapshot)
+        finally:
+            self.session.resume()
+        self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -136,10 +160,9 @@ class AgenticEvaluatorRuntime:
             "task": self.task_name,
             "instance_id": self.instance_id,
             "episode_id": self.episode_id,
+            "attempt_index": self.attempt_index,
             "controller_manifest": self.controller_manifest.to_dict(),
-            "camera_keys": {
-                camera: f"{name}::rgb" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()
-            },
+            "camera_keys": {camera: f"{name}::rgb" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()},
             "proprio_key": "robot_r1::proprio",
             "available_modalities": ["rgb", "proprio", "task_progress_for_policy"],
         }
@@ -158,6 +181,7 @@ class AgenticEvaluatorRuntime:
             "executed_action": np.asarray(self.evaluator.robot_action, dtype=np.float32).reshape(-1)
             if np.asarray(self.evaluator.robot_action).size == self.controller_manifest.action_dim
             else reference_action,
+            "attempt_index": self.attempt_index,
         }
 
     def step(self, action: object) -> dict[str, object]:
@@ -210,6 +234,8 @@ class AgenticEvaluatorRuntime:
         return {"snapshot_id": snapshot_id, "restore_report": report.to_dict(), **self.observe()}
 
     def finish(self) -> dict[str, object]:
+        if self._last_metrics is not None:
+            return self._last_metrics
         if not self._metrics_finished:
             for metric in self.evaluator.metrics:
                 metric.end_callback(self.evaluator.env)
@@ -223,7 +249,26 @@ class AgenticEvaluatorRuntime:
         metrics["env_step"] = int(self.evaluator.env._current_step)
         metrics["success"] = bool(self.last_info.get("done", {}).get("success", False))
         self.finished = True
-        return _jsonable(metrics)
+        self._last_metrics = _jsonable(metrics)
+        return self._last_metrics
+
+    def reset_attempt(self) -> dict[str, object]:
+        if not self.finished:
+            raise RuntimeError("Current attempt must be scored before reset.")
+        self.session.pause()
+        try:
+            report = self.session.restore(self.initial_snapshot)
+        finally:
+            self.session.resume()
+        self.attempt_index += 1
+        self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
+        return {
+            "reset": True,
+            "attempt_index": self.attempt_index,
+            "initial_snapshot_id": self.initial_snapshot.snapshot_id,
+            "restore_report": report.to_dict(),
+            **self.observe(),
+        }
 
     def close(self) -> None:
         self.session.close()
@@ -308,6 +353,8 @@ class AgenticEnvironmentWebsocketServer:
             return self.runtime.restore(str(request.get("snapshot_id")))
         if operation == "finish":
             return self.runtime.finish()
+        if operation == "reset_attempt":
+            return self.runtime.reset_attempt()
         raise ValueError(f"Unsupported agentic environment operation: {operation!r}.")
 
 
