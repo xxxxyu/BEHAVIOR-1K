@@ -22,6 +22,7 @@ from omnigibson.learning.agentic.controller_manifest import build_controller_man
 from omnigibson.learning.agentic.controller_manifest import validate_r1pro_manifest
 from omnigibson.learning.agentic.environment_session import AgenticEnvironmentSession
 from omnigibson.learning.agentic.evaluator_state import EvaluatorSnapshotComponent
+from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
@@ -29,6 +30,8 @@ from omnigibson.learning.eval_custom import Evaluator
 from omnigibson.learning.eval_custom import _normalize_task_progress
 from omnigibson.learning.utils.array_tensor_utils import torch_to_numpy
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
+from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS
+from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.network_utils import Packer
 from omnigibson.learning.utils.network_utils import unpackb
@@ -41,6 +44,7 @@ import websockets.asyncio.server as websocket_server
 
 logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 2
+CAMERA_POSE_KEY = "robot_r1::cam_rel_poses"
 
 
 def _no_op_action(robot: object) -> np.ndarray:
@@ -176,6 +180,19 @@ class AgenticEvaluatorRuntime:
             "controller_manifest": self.controller_manifest.to_dict(),
             "camera_keys": {camera: f"{name}::rgb" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()},
             "proprio_key": "robot_r1::proprio",
+            "camera_pose_key": CAMERA_POSE_KEY,
+            "camera_pose_order": list(ROBOT_CAMERA_NAMES["R1Pro"]),
+            "camera_intrinsics": {
+                camera: intrinsics.tolist() for camera, intrinsics in CAMERA_INTRINSICS["R1Pro"].items()
+            },
+            "camera_native_sizes": {
+                "head": [720, 720],
+                "left_wrist": [480, 480],
+                "right_wrist": [480, 480],
+            },
+            "proprio_fields": {
+                name: [int(index.start), int(index.stop)] for name, index in PROPRIOCEPTION_INDICES["R1Pro"].items()
+            },
             "information_arm": self.information_arm,
             "available_modalities": ["rgb", "proprio"],
         }
@@ -185,6 +202,48 @@ class AgenticEvaluatorRuntime:
             }
             metadata["available_modalities"].append("depth_linear")
         return metadata
+
+    def plan_eef_position(
+        self,
+        *,
+        arm: str,
+        target_position: object,
+        max_target_delta_m: float = 0.12,
+        max_joint_delta_rad: float = 0.20,
+    ) -> dict[str, object]:
+        """Return one bounded local IK target without executing or changing state."""
+
+        if arm not in {"left", "right"}:
+            raise ValueError("arm must be 'left' or 'right'.")
+        if not 0 < max_target_delta_m <= 0.20:
+            raise ValueError("max_target_delta_m must be within (0, 0.20].")
+        if not 0 < max_joint_delta_rad <= 0.35:
+            raise ValueError("max_joint_delta_rad must be within (0, 0.35].")
+        controller = self.robot.controllers[f"arm_{arm}"]
+        control_dict = self.robot.get_control_dict()
+        dof_indices = np.asarray(controller.dof_idx, dtype=np.int64)
+        lower_all, upper_all = controller._control_limits[controller.control_type]
+        result = bounded_position_ik_step(
+            joint_positions=torch_to_numpy(control_dict["joint_position"])[dof_indices],
+            jacobian=torch_to_numpy(control_dict[f"eef_{arm}_jacobian_relative"][:, dof_indices]),
+            eef_position=torch_to_numpy(control_dict[f"eef_{arm}_pos_relative"]),
+            target_position=np.asarray(target_position, dtype=np.float32),
+            joint_lower=torch_to_numpy(lower_all)[dof_indices],
+            joint_upper=torch_to_numpy(upper_all)[dof_indices],
+            max_target_delta_m=max_target_delta_m,
+            max_joint_delta_rad=max_joint_delta_rad,
+        )
+        return {
+            "observation_id": self._observation_id(torch_to_numpy(self.evaluator.obs)),
+            "env_step": int(self.evaluator.env._current_step),
+            "arm": arm,
+            "controller_segment": f"arm_{arm}",
+            "current_eef_position_robot_m": _jsonable(control_dict[f"eef_{arm}_pos_relative"]),
+            "requested_target_position_robot_m": _jsonable(np.asarray(target_position, dtype=np.float32)),
+            "orientation_policy": "keep_current_orientation_local_linearization",
+            "collision_checked": False,
+            **_jsonable(result),
+        }
 
     def observe(self) -> dict[str, object]:
         observation = torch_to_numpy(self.evaluator.obs)
@@ -318,6 +377,7 @@ class AgenticEvaluatorRuntime:
         sensor_keys = list(self.metadata["camera_keys"].values())
         sensor_keys.extend(self.metadata.get("depth_keys", {}).values())
         sensor_keys.append(self.metadata["proprio_key"])
+        sensor_keys.append(self.metadata["camera_pose_key"])
         for key in sensor_keys:
             value = np.asarray(observation[str(key)])
             hasher.update(str(value.dtype).encode())
@@ -393,6 +453,13 @@ class AgenticEnvironmentWebsocketServer:
         if operation == "reset_attempt":
             snapshot_id = request.get("snapshot_id")
             return self.runtime.reset_attempt(str(snapshot_id) if snapshot_id else None)
+        if operation == "plan_eef_position":
+            return self.runtime.plan_eef_position(
+                arm=str(request.get("arm")),
+                target_position=request.get("target_position"),
+                max_target_delta_m=float(request.get("max_target_delta_m", 0.12)),
+                max_joint_delta_rad=float(request.get("max_joint_delta_rad", 0.20)),
+            )
         raise ValueError(f"Unsupported agentic environment operation: {operation!r}.")
 
 
