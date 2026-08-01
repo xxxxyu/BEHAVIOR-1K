@@ -161,6 +161,8 @@ class AgenticEvaluatorRuntime:
             "instance_id": self.instance_id,
             "episode_id": self.episode_id,
             "attempt_index": self.attempt_index,
+            "initial_snapshot_id": self.initial_snapshot.snapshot_id,
+            "initial_restore_report": self.initial_restore_report.to_dict(),
             "controller_manifest": self.controller_manifest.to_dict(),
             "camera_keys": {camera: f"{name}::rgb" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()},
             "proprio_key": "robot_r1::proprio",
