@@ -75,8 +75,18 @@ def _write_json_atomic(path: Path, value: Mapping[str, object]) -> None:
 class AgenticEvaluatorRuntime:
     """Keeps the official evaluator state synchronized with explicit tool steps."""
 
-    def __init__(self, config: object, *, instance_id: int, episode_id: str) -> None:
+    def __init__(
+        self,
+        config: object,
+        *,
+        instance_id: int,
+        episode_id: str,
+        information_arm: str = "vision_rgb",
+    ) -> None:
+        if information_arm not in {"vision_rgb", "vision_rgb_depth"}:
+            raise ValueError(f"Unsupported agentic information arm: {information_arm!r}.")
         self.config = config
+        self.information_arm = information_arm
         self.task_name = str(config.task.name)
         self.instance_id = int(instance_id)
         self.episode_id = episode_id
@@ -154,7 +164,7 @@ class AgenticEvaluatorRuntime:
 
     @property
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "service": "behavior_agentic_environment",
             "protocol_version": PROTOCOL_VERSION,
             "task": self.task_name,
@@ -166,8 +176,15 @@ class AgenticEvaluatorRuntime:
             "controller_manifest": self.controller_manifest.to_dict(),
             "camera_keys": {camera: f"{name}::rgb" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()},
             "proprio_key": "robot_r1::proprio",
-            "available_modalities": ["rgb", "proprio", "task_progress_for_policy"],
+            "information_arm": self.information_arm,
+            "available_modalities": ["rgb", "proprio"],
         }
+        if self.information_arm == "vision_rgb_depth":
+            metadata["depth_keys"] = {
+                camera: f"{name}::depth_linear" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()
+            }
+            metadata["available_modalities"].append("depth_linear")
+        return metadata
 
     def observe(self) -> dict[str, object]:
         observation = torch_to_numpy(self.evaluator.obs)
@@ -254,12 +271,19 @@ class AgenticEvaluatorRuntime:
         self._last_metrics = _jsonable(metrics)
         return self._last_metrics
 
-    def reset_attempt(self) -> dict[str, object]:
+    def reset_attempt(self, snapshot_id: str | None = None) -> dict[str, object]:
         if not self.finished:
             raise RuntimeError("Current attempt must be scored before reset.")
+        if snapshot_id is None:
+            snapshot = self.initial_snapshot
+        else:
+            try:
+                snapshot = self.snapshots[snapshot_id]
+            except KeyError as exc:
+                raise ValueError(f"Unknown in-process environment snapshot: {snapshot_id}.") from exc
         self.session.pause()
         try:
-            report = self.session.restore(self.initial_snapshot)
+            report = self.session.restore(snapshot)
         finally:
             self.session.resume()
         self.attempt_index += 1
@@ -268,6 +292,7 @@ class AgenticEvaluatorRuntime:
             "reset": True,
             "attempt_index": self.attempt_index,
             "initial_snapshot_id": self.initial_snapshot.snapshot_id,
+            "restored_snapshot_id": snapshot.snapshot_id,
             "restore_report": report.to_dict(),
             **self.observe(),
         }
@@ -290,7 +315,10 @@ class AgenticEvaluatorRuntime:
     def _observation_id(self, observation: Mapping[str, object]) -> str:
         hasher = hashlib.sha256()
         hasher.update(str(int(self.evaluator.env._current_step)).encode())
-        for key in (*self.metadata["camera_keys"].values(), self.metadata["proprio_key"]):
+        sensor_keys = list(self.metadata["camera_keys"].values())
+        sensor_keys.extend(self.metadata.get("depth_keys", {}).values())
+        sensor_keys.append(self.metadata["proprio_key"])
+        for key in sensor_keys:
             value = np.asarray(observation[str(key)])
             hasher.update(str(value.dtype).encode())
             hasher.update(repr(value.shape).encode())
@@ -363,7 +391,8 @@ class AgenticEnvironmentWebsocketServer:
         if operation == "finish":
             return self.runtime.finish()
         if operation == "reset_attempt":
-            return self.runtime.reset_attempt()
+            snapshot_id = request.get("snapshot_id")
+            return self.runtime.reset_attempt(str(snapshot_id) if snapshot_id else None)
         raise ValueError(f"Unsupported agentic environment operation: {operation!r}.")
 
 
@@ -384,7 +413,11 @@ def _compose_config(args: argparse.Namespace) -> object:
         "write_video=false",
         "save_rollout=false",
         "perturb_pose=false",
-        "env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper",
+        (
+            "env_wrapper._target_=omnigibson.learning.agentic.rgb_depth_wrapper.AgenticRGBDepthWrapper"
+            if args.information_arm == "vision_rgb_depth"
+            else "env_wrapper._target_=omnigibson.learning.wrappers.RGBWrapper"
+        ),
     ]
     if args.max_steps is not None:
         overrides.append(f"max_steps={args.max_steps}")
@@ -404,6 +437,11 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--information-arm",
+        choices=("vision_rgb", "vision_rgb_depth"),
+        default="vision_rgb",
+    )
     parser.add_argument("--hydra-override", action="append", default=[])
     parser.add_argument("--startup-report", type=Path)
     args = parser.parse_args()
@@ -415,7 +453,12 @@ def main() -> None:
     runtime = None
     exit_code = 0
     try:
-        runtime = AgenticEvaluatorRuntime(config, instance_id=args.instance_id, episode_id=args.episode_id)
+        runtime = AgenticEvaluatorRuntime(
+            config,
+            instance_id=args.instance_id,
+            episode_id=args.episode_id,
+            information_arm=args.information_arm,
+        )
         _write_json_atomic(
             startup_report,
             {
@@ -424,6 +467,8 @@ def main() -> None:
                 "instance_id": args.instance_id,
                 "host": args.host,
                 "port": args.port,
+                "information_arm": args.information_arm,
+                "available_modalities": runtime.metadata["available_modalities"],
                 "controller_manifest": runtime.controller_manifest.to_dict(),
             },
         )
