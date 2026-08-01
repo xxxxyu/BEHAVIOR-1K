@@ -278,7 +278,14 @@ class AgenticEvaluatorRuntime:
 
     def _propagate_once(self) -> dict[str, float]:
         og.sim.step()
-        return {"sim_step_dt": float(og.sim.get_sim_step_dt())}
+        # A loaded simulator state reaches the camera render products one render
+        # after the physics propagation. Without this refresh, reset/restore can
+        # return current proprioception with RGB cached from the prior attempt.
+        og.sim.render()
+        return {
+            "sim_step_dt": float(og.sim.get_sim_step_dt()),
+            "post_restore_render_steps": 1.0,
+        }
 
     def _observation_id(self, observation: Mapping[str, object]) -> str:
         hasher = hashlib.sha256()
