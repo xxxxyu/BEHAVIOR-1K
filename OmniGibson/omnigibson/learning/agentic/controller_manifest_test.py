@@ -4,6 +4,7 @@ import pytest
 
 from controller_manifest import ControllerManifestError
 from controller_manifest import build_controller_manifest
+from controller_manifest import normalize_runtime_reference_action
 from controller_manifest import validate_runtime_action
 from controller_manifest import validate_r1pro_manifest
 
@@ -95,6 +96,25 @@ def test_build_and_validate_r1pro_manifest():
     assert manifest.segments[2].safety_input_limits == ((-3.0,) * 7, (3.0,) * 7)
     assert manifest.segments[3].semantic == "normalized_gripper"
     assert manifest.fingerprint == manifest.to_dict()["fingerprint"]
+
+
+def test_runtime_reference_normalizes_only_float_boundary_drift():
+    manifest = build_controller_manifest(R1Pro(), physics_frequency_hz=120.0)
+    reference = [0.0] * manifest.action_dim
+    reference[16] = 3.0 + 2e-6
+
+    normalized = normalize_runtime_reference_action(reference, manifest)
+
+    assert normalized[16] == 3.0
+
+
+def test_runtime_reference_rejects_material_limit_violation():
+    manifest = build_controller_manifest(R1Pro(), physics_frequency_hz=120.0)
+    reference = [0.0] * manifest.action_dim
+    reference[16] = 3.01
+
+    with pytest.raises(ControllerManifestError, match="beyond numerical tolerance"):
+        normalize_runtime_reference_action(reference, manifest)
 
 
 def test_rejects_noncontiguous_runtime_action_indices():

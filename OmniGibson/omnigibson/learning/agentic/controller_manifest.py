@@ -13,6 +13,7 @@ import numpy as np
 
 
 CONTROLLER_MANIFEST_SCHEMA_VERSION = 1
+RUNTIME_REFERENCE_LIMIT_TOLERANCE = 1e-5
 R1PRO_CONTROLLER_WIDTHS = {
     "base": 3,
     "trunk": 4,
@@ -214,6 +215,40 @@ class ControllerManifest:
         if include_fingerprint:
             value["fingerprint"] = self.fingerprint
         return value
+
+
+def normalize_runtime_reference_action(
+    action: object,
+    manifest: ControllerManifest,
+    *,
+    tolerance: float = RUNTIME_REFERENCE_LIMIT_TOLERANCE,
+) -> np.ndarray:
+    """Clamp runtime-generated no-op references only within numerical tolerance."""
+
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ControllerManifestError("Runtime reference tolerance must be finite and non-negative.")
+    array = np.asarray(action, dtype=np.float32).reshape(-1)
+    if array.shape != (manifest.action_dim,) or not np.isfinite(array).all():
+        raise ControllerManifestError(
+            f"Runtime reference action must be finite with shape ({manifest.action_dim},), got {array.shape}."
+        )
+    lower = np.concatenate(
+        [np.asarray(segment.safety_input_limits[0], dtype=np.float32) for segment in manifest.segments]
+    )
+    upper = np.concatenate(
+        [np.asarray(segment.safety_input_limits[1], dtype=np.float32) for segment in manifest.segments]
+    )
+    below = lower - array
+    above = array - upper
+    violation = np.maximum(below, above)
+    if np.any(violation > tolerance):
+        channel = int(np.argmax(violation))
+        raise ControllerManifestError(
+            "Runtime-generated reference action exceeds controller limits beyond numerical tolerance: "
+            f"channel={channel} value={float(array[channel])} "
+            f"limits=[{float(lower[channel])}, {float(upper[channel])}] tolerance={tolerance}."
+        )
+    return np.clip(array, lower, upper).astype(np.float32, copy=False)
 
 
 def build_controller_manifest(

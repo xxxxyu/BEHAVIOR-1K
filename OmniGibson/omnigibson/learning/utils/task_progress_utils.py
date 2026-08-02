@@ -1070,7 +1070,19 @@ CHALLENGE_TASKS_PROGRESS_APPROXIMATION = {
         env,
         {
             "robot_near_radio": ("near", "agent.n.01_1", "radio_receiver.n.01_1"),
-            "radio_picked_up": ("state", "radio_receiver.n.01_1", OnTop, "table.n.02_1", False),
+            "radio_picked_up": (
+                "all_state",
+                [
+                    ("state", "radio_receiver.n.01_1", OnTop, "table.n.02_1", False),
+                    (
+                        "any_state",
+                        [
+                            ("grasping_arm", "agent.n.01_1", "radio_receiver.n.01_1", "left", True),
+                            ("grasping_arm", "agent.n.01_1", "radio_receiver.n.01_1", "right", True),
+                        ],
+                    ),
+                ],
+            ),
             "radio_on": ("state", "radio_receiver.n.01_1", ToggledOn, True),
         },
     ),

@@ -6,7 +6,10 @@ from collections.abc import Callable, Mapping, Sequence
 import copy
 import dataclasses
 import hashlib
+import json
 import math
+import os
+from pathlib import Path
 import pickle
 import random
 import time
@@ -14,6 +17,7 @@ from typing import Any, Protocol
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
+PERSISTED_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 class SnapshotError(RuntimeError):
@@ -269,6 +273,7 @@ class CompositeSnapshotManager:
         controller_fingerprint: str,
         components: Sequence[SnapshotComponent] = (),
         propagate_once: Callable[[], Mapping[str, object] | None],
+        restore_diagnostic: Callable[[str, CompositeSnapshot], None] | None = None,
         serialized_simulator_state: bool = True,
     ) -> None:
         if not runtime_fingerprint or not controller_fingerprint:
@@ -282,7 +287,16 @@ class CompositeSnapshotManager:
         self.controller_fingerprint = controller_fingerprint
         self.components = tuple(components)
         self.propagate_once = propagate_once
+        self.restore_diagnostic = restore_diagnostic
         self.serialized_simulator_state = serialized_simulator_state
+        self._restore_failure_once: str | None = None
+
+    def inject_restore_failure_once(self, reason: str) -> None:
+        if not reason.strip():
+            raise ValueError("Injected restore failure requires a reason.")
+        if self._restore_failure_once is not None:
+            raise RuntimeError("A restore failure is already pending.")
+        self._restore_failure_once = reason
 
     def capture(
         self,
@@ -318,36 +332,68 @@ class CompositeSnapshotManager:
 
     def restore(self, snapshot: CompositeSnapshot) -> RestoreReport:
         self._validate_compatibility(snapshot)
+        rollback = self.capture(
+            task_name=snapshot.metadata.task_name,
+            instance_id=snapshot.metadata.instance_id,
+            episode_id=snapshot.metadata.episode_id,
+            parent_snapshot_id=snapshot.snapshot_id,
+        )
+        self._emit_restore_diagnostic("before_target_restore", snapshot)
         started = time.monotonic()
         try:
-            self.simulator.load_state(
-                _clone_value(snapshot.simulator_state), serialized=self.serialized_simulator_state
-            )
-            setattr(self.env, "_current_step", snapshot.metadata.env_step)
-            setattr(self.env, "_current_episode", snapshot.env_episode)
-            for component in self.components:
-                component.restore(_clone_value(snapshot.component_states[component.name]))
-            _restore_rng(snapshot.rng_state)
-
-            propagation = self.propagate_once()
-            propagation_details = (
-                {
-                    "kind": "omnigibson_post_load_state_propagation",
-                    "sim_steps": 1,
-                    "environment_step_increment": 0,
-                    **dict(propagation or {}),
-                },
-            )
-            component_reports: dict[str, Mapping[str, object]] = {}
-            for component in self.components:
-                report = component.after_propagation(_clone_value(snapshot.component_states[component.name]))
-                if report is not None:
-                    component_reports[component.name] = dict(report)
-        except SnapshotError:
-            raise
+            report = self._restore_once(snapshot, started=started)
+            self._emit_restore_diagnostic("target_restore_complete", snapshot)
+            return report
         except Exception as exc:
-            raise SnapshotRestoreError(f"Failed to restore snapshot {snapshot.snapshot_id}.") from exc
+            self._emit_restore_diagnostic("target_restore_failed_before_rollback", snapshot)
+            self._restore_failure_once = None
+            try:
+                self._restore_once(rollback, started=time.monotonic())
+                self._emit_restore_diagnostic("rollback_complete", rollback)
+            except Exception as rollback_exc:
+                raise SnapshotRestoreError(
+                    f"Snapshot {snapshot.snapshot_id} restore failed ({exc}); rollback to "
+                    f"{rollback.snapshot_id} also failed ({rollback_exc})."
+                ) from rollback_exc
+            raise SnapshotRestoreError(
+                f"Snapshot {snapshot.snapshot_id} restore failed and was rolled back: {exc}"
+            ) from exc
 
+    def _emit_restore_diagnostic(self, phase: str, snapshot: CompositeSnapshot) -> None:
+        if self.restore_diagnostic is None:
+            return
+        try:
+            self.restore_diagnostic(phase, snapshot)
+        except Exception:
+            # Diagnostics must never alter restore semantics.
+            return
+
+    def _restore_once(self, snapshot: CompositeSnapshot, *, started: float) -> RestoreReport:
+        self.simulator.load_state(_clone_value(snapshot.simulator_state), serialized=self.serialized_simulator_state)
+        setattr(self.env, "_current_step", snapshot.metadata.env_step)
+        setattr(self.env, "_current_episode", snapshot.env_episode)
+        for component in self.components:
+            component.restore(_clone_value(snapshot.component_states[component.name]))
+        _restore_rng(snapshot.rng_state)
+
+        propagation = self.propagate_once()
+        propagation_details = (
+            {
+                "kind": "omnigibson_post_load_state_propagation",
+                "sim_steps": 1,
+                "environment_step_increment": 0,
+                **dict(propagation or {}),
+            },
+        )
+        component_reports: dict[str, Mapping[str, object]] = {}
+        for component in self.components:
+            report = component.after_propagation(_clone_value(snapshot.component_states[component.name]))
+            if report is not None:
+                component_reports[component.name] = dict(report)
+        if self._restore_failure_once is not None:
+            reason = self._restore_failure_once
+            self._restore_failure_once = None
+            raise SnapshotRestoreError(f"Injected post-propagation restore failure: {reason}")
         return RestoreReport(
             snapshot_id=snapshot.snapshot_id,
             restored_env_step=int(getattr(self.env, "_current_step")),
@@ -365,3 +411,70 @@ class CompositeSnapshotManager:
         expected_components = {component.name for component in self.components}
         if set(snapshot.component_states) != expected_components:
             raise SnapshotCompatibilityError("Snapshot component set does not match the active snapshot manager.")
+
+
+def persist_snapshot(snapshot: CompositeSnapshot, directory: Path) -> dict[str, str]:
+    """Persist one runtime-private snapshot with an independently verified payload hash."""
+
+    expected_id = _snapshot_id(
+        snapshot.metadata,
+        snapshot.simulator_state,
+        snapshot.env_episode,
+        snapshot.component_states,
+        snapshot.rng_state,
+    )
+    if snapshot.snapshot_id != expected_id:
+        raise SnapshotError("Snapshot identity does not match its payload.")
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    stem = snapshot.snapshot_id.removeprefix("sha256:")
+    payload_path = directory / f"{stem}.pkl"
+    manifest_path = directory / f"{stem}.json"
+    if payload_path.exists() and manifest_path.exists():
+        existing = load_persisted_snapshot(manifest_path)
+        if existing.snapshot_id != snapshot.snapshot_id:
+            raise FileExistsError(f"Conflicting persisted snapshot: {snapshot.snapshot_id}.")
+        return {"manifest_path": str(manifest_path), "payload_path": str(payload_path)}
+    if payload_path.exists() or manifest_path.exists():
+        raise FileExistsError(f"Incomplete persisted snapshot: {snapshot.snapshot_id}.")
+    payload = pickle.dumps(snapshot, protocol=5)
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    manifest = {
+        "schema_version": PERSISTED_SNAPSHOT_SCHEMA_VERSION,
+        "snapshot_id": snapshot.snapshot_id,
+        "payload_file": payload_path.name,
+        "payload_sha256": payload_sha256,
+        "metadata": snapshot.metadata.to_dict(),
+    }
+    temporary_payload = payload_path.with_name(f".{payload_path.name}.{os.getpid()}.tmp")
+    temporary_manifest = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
+    temporary_payload.write_bytes(payload)
+    os.chmod(temporary_payload, 0o600)
+    temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary_manifest, 0o600)
+    temporary_payload.replace(payload_path)
+    temporary_manifest.replace(manifest_path)
+    return {"manifest_path": str(manifest_path), "payload_path": str(payload_path)}
+
+
+def load_persisted_snapshot(manifest_path: Path) -> CompositeSnapshot:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != PERSISTED_SNAPSHOT_SCHEMA_VERSION:
+        raise SnapshotCompatibilityError("Unsupported persisted snapshot schema.")
+    payload_path = manifest_path.parent / str(manifest.get("payload_file"))
+    payload = payload_path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != manifest.get("payload_sha256"):
+        raise SnapshotCompatibilityError("Persisted snapshot payload hash does not match its manifest.")
+    snapshot = pickle.loads(payload)
+    if not isinstance(snapshot, CompositeSnapshot):
+        raise SnapshotCompatibilityError("Persisted payload is not a CompositeSnapshot.")
+    expected_id = _snapshot_id(
+        snapshot.metadata,
+        snapshot.simulator_state,
+        snapshot.env_episode,
+        snapshot.component_states,
+        snapshot.rng_state,
+    )
+    if snapshot.snapshot_id != manifest.get("snapshot_id") or snapshot.snapshot_id != expected_id:
+        raise SnapshotCompatibilityError("Persisted snapshot identity validation failed.")
+    return snapshot

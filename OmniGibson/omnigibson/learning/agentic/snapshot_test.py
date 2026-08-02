@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 import random
 
 import pytest
 
 from snapshot import AttributeSnapshotComponent
 from snapshot import CompositeSnapshotManager
+from snapshot import load_persisted_snapshot
+from snapshot import persist_snapshot
 from snapshot import SnapshotCompatibilityError
+from snapshot import SnapshotRestoreError
 
 
 class FakeSimulator:
@@ -122,3 +126,60 @@ def test_snapshot_id_changes_with_parent_lineage():
     second = manager.capture(task_name="task", instance_id="1", episode_id="e", parent_snapshot_id=first.snapshot_id)
 
     assert first.snapshot_id != second.snapshot_id
+
+
+def test_failed_restore_rolls_back_simulator_components_and_lifecycle():
+    simulator = FakeSimulator()
+    env = FakeEnv()
+    episode_state = EpisodeState({"near": False}, [[0.1]])
+
+    def reject_false_progress(state):
+        if state["latest_progress"]["near"] is False:
+            raise SnapshotRestoreError("injected post-propagation failure")
+        return {"progress_recomputed": True}
+
+    component = AttributeSnapshotComponent(
+        name="episode_state",
+        owner=episode_state,
+        attributes=("latest_progress", "action_queue"),
+        after_propagation_callback=reject_false_progress,
+    )
+    manager = CompositeSnapshotManager(
+        simulator=simulator,
+        env=env,
+        runtime_fingerprint="behavior@abc",
+        controller_fingerprint="controller@123",
+        components=(component,),
+        propagate_once=simulator.propagate,
+    )
+    rejected = manager.capture(task_name="task", instance_id="1", episode_id="e")
+    simulator.state = {"position": [7.0, 8.0], "grasped": False}
+    env._current_step = 42
+    env._current_episode = 9
+    episode_state.latest_progress = {"near": True}
+    episode_state.action_queue = [[9.0]]
+
+    with pytest.raises(SnapshotRestoreError, match="rolled back.*injected post-propagation failure"):
+        manager.restore(rejected)
+
+    assert simulator.state == {"position": [7.0, 8.0], "grasped": False}
+    assert env == FakeEnv(_current_step=42, _current_episode=9)
+    assert episode_state == EpisodeState({"near": True}, [[9.0]])
+
+
+def test_persisted_snapshot_round_trip_and_hash_validation(tmp_path):
+    simulator = FakeSimulator()
+    env = FakeEnv()
+    episode_state = EpisodeState({"near": True}, [[0.1]])
+    snapshot = make_manager(simulator, env, episode_state).capture(task_name="task", instance_id="1", episode_id="e")
+
+    paths = persist_snapshot(snapshot, tmp_path / "snapshots")
+    loaded = load_persisted_snapshot(Path(paths["manifest_path"]))
+
+    assert loaded.snapshot_id == snapshot.snapshot_id
+    assert loaded.simulator_state == snapshot.simulator_state
+
+    payload_path = Path(paths["payload_path"])
+    payload_path.write_bytes(payload_path.read_bytes() + b"tampered")
+    with pytest.raises(SnapshotCompatibilityError, match="payload hash"):
+        load_persisted_snapshot(Path(paths["manifest_path"]))

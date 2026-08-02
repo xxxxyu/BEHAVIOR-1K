@@ -19,6 +19,7 @@ import numpy as np
 from omegaconf import OmegaConf
 import omnigibson as og
 from omnigibson.learning.agentic.controller_manifest import build_controller_manifest
+from omnigibson.learning.agentic.controller_manifest import normalize_runtime_reference_action
 from omnigibson.learning.agentic.controller_manifest import validate_r1pro_manifest
 from omnigibson.learning.agentic.environment_session import AgenticEnvironmentSession
 from omnigibson.learning.agentic.evaluator_state import EvaluatorSnapshotComponent
@@ -26,8 +27,12 @@ from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
+from omnigibson.learning.agentic.snapshot import load_persisted_snapshot
+from omnigibson.learning.agentic.snapshot import persist_snapshot
 from omnigibson.learning.eval_custom import Evaluator
 from omnigibson.learning.eval_custom import _normalize_task_progress
+from omnigibson.object_states import ContactBodies
+from omnigibson.object_states import OnTop
 from omnigibson.learning.utils.array_tensor_utils import torch_to_numpy
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
 from omnigibson.learning.utils.eval_utils import CAMERA_INTRINSICS
@@ -36,6 +41,7 @@ from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.network_utils import Packer
 from omnigibson.learning.utils.network_utils import unpackb
 from omnigibson.learning.utils.task_progress_utils import CHALLENGE_TASKS_PROGRESS_APPROXIMATION
+from omnigibson.learning.utils.task_progress_utils import _resolve_object
 from omnigibson.macros import gm
 import torch as th
 import websockets
@@ -86,6 +92,8 @@ class AgenticEvaluatorRuntime:
         instance_id: int,
         episode_id: str,
         information_arm: str = "vision_rgb",
+        snapshot_dir: Path | None = None,
+        snapshot_import_dirs: tuple[Path, ...] = (),
     ) -> None:
         if information_arm not in {"vision_rgb", "vision_rgb_depth"}:
             raise ValueError(f"Unsupported agentic information arm: {information_arm!r}.")
@@ -94,6 +102,8 @@ class AgenticEvaluatorRuntime:
         self.task_name = str(config.task.name)
         self.instance_id = int(instance_id)
         self.episode_id = episode_id
+        self.snapshot_dir = snapshot_dir
+        self.snapshot_import_dirs = snapshot_import_dirs
         self.evaluator = Evaluator(config)
         self.evaluator.reset()
         self.evaluator.load_task_instance(self.instance_id)
@@ -145,6 +155,7 @@ class AgenticEvaluatorRuntime:
             controller_fingerprint=self.controller_manifest.fingerprint,
             components=(evaluator_component, runtime_component),
             propagate_once=self._propagate_once,
+            restore_diagnostic=self._log_restore_diagnostic,
         )
         self.session = AgenticEnvironmentSession(
             env=self.evaluator.env,
@@ -164,6 +175,9 @@ class AgenticEvaluatorRuntime:
             self.initial_restore_report = self.session.restore(self.initial_snapshot)
         finally:
             self.session.resume()
+        if self.snapshot_dir is not None:
+            persist_snapshot(self.initial_snapshot, self.snapshot_dir)
+        self.imported_snapshot_count = self._load_imported_snapshots()
         self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
 
     @property
@@ -195,6 +209,8 @@ class AgenticEvaluatorRuntime:
             },
             "information_arm": self.information_arm,
             "available_modalities": ["rgb", "proprio"],
+            "durable_snapshots": self.snapshot_dir is not None,
+            "imported_snapshot_count": self.imported_snapshot_count,
         }
         if self.information_arm == "vision_rgb_depth":
             metadata["depth_keys"] = {
@@ -247,7 +263,7 @@ class AgenticEvaluatorRuntime:
 
     def observe(self) -> dict[str, object]:
         observation = torch_to_numpy(self.evaluator.obs)
-        reference_action = _no_op_action(self.robot)
+        reference_action = normalize_runtime_reference_action(_no_op_action(self.robot), self.controller_manifest)
         return {
             "observation_id": self._observation_id(observation),
             "env_step": int(self.evaluator.env._current_step),
@@ -294,6 +310,8 @@ class AgenticEvaluatorRuntime:
                 episode_id=self.episode_id,
                 parent_snapshot_id=parent_snapshot_id,
             )
+            if self.snapshot_dir is not None:
+                persist_snapshot(snapshot, self.snapshot_dir)
             self.snapshots[snapshot.snapshot_id] = snapshot
         finally:
             self.session.resume()
@@ -360,6 +378,51 @@ class AgenticEvaluatorRuntime:
         self.session.close()
         self.evaluator.env.close()
 
+    def _load_imported_snapshots(self) -> int:
+        imported = 0
+        for directory in self.snapshot_import_dirs:
+            for manifest_path in sorted(directory.glob("*.json")):
+                snapshot = load_persisted_snapshot(manifest_path)
+                self.session.snapshot_manager._validate_compatibility(snapshot)
+                if snapshot.metadata.task_name != self.task_name:
+                    raise ValueError(
+                        f"Imported snapshot task {snapshot.metadata.task_name!r} does not match {self.task_name!r}."
+                    )
+                if snapshot.metadata.instance_id != str(self.instance_id):
+                    raise ValueError(
+                        f"Imported snapshot instance {snapshot.metadata.instance_id!r} does not match {self.instance_id}."
+                    )
+                if snapshot.snapshot_id not in self.snapshots:
+                    self.snapshots[snapshot.snapshot_id] = snapshot
+                    imported += 1
+        return imported
+
+    def _log_restore_diagnostic(self, phase: str, snapshot: CompositeSnapshot) -> None:
+        if self.task_name != "turning_on_radio":
+            return
+        env = self.evaluator.env
+        radio = _resolve_object(env, "radio_receiver.n.01_1").unwrapped
+        table = _resolve_object(env, "table.n.02_1").unwrapped
+        position, orientation = radio.get_position_orientation()
+        contact_bodies = radio.states[ContactBodies].get_value()
+        details = {
+            "phase": phase,
+            "snapshot_id": snapshot.snapshot_id,
+            "env_step": int(env._current_step),
+            "radio_position": _jsonable(position),
+            "radio_orientation": _jsonable(orientation),
+            "radio_linear_velocity": _jsonable(radio.get_linear_velocity()),
+            "radio_angular_velocity": _jsonable(radio.get_angular_velocity()),
+            "radio_on_table": bool(radio.states[OnTop].get_value(table)),
+            "grasping_left": int(self.robot.is_grasping(arm="left", candidate_obj=radio)),
+            "grasping_right": int(self.robot.is_grasping(arm="right", candidate_obj=radio)),
+            "contact_body_paths": sorted(str(getattr(body, "prim_path", body)) for body in contact_bodies),
+            "assisted_grasp_attachments": {
+                arm: getattr(obj, "name", None) for arm, obj in self.robot._ag_obj_in_hand.items()
+            },
+        }
+        logger.info("agentic_radio_restore_diagnostic %s", json.dumps(details, sort_keys=True))
+
     def _propagate_once(self) -> dict[str, float]:
         og.sim.step()
         # A loaded simulator state reaches the camera render products one render
@@ -387,12 +450,20 @@ class AgenticEvaluatorRuntime:
 
 
 class AgenticEnvironmentWebsocketServer:
-    def __init__(self, runtime: AgenticEvaluatorRuntime, *, host: str, port: int) -> None:
+    def __init__(
+        self,
+        runtime: AgenticEvaluatorRuntime,
+        *,
+        host: str,
+        port: int,
+        enable_restore_failure_injection: bool = False,
+    ) -> None:
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("The initial agentic environment service must bind only to loopback.")
         self.runtime = runtime
         self.host = host
         self.port = port
+        self.enable_restore_failure_injection = enable_restore_failure_injection
         self._client_lock = asyncio.Lock()
 
     def serve_forever(self) -> None:
@@ -460,6 +531,13 @@ class AgenticEnvironmentWebsocketServer:
                 max_target_delta_m=float(request.get("max_target_delta_m", 0.12)),
                 max_joint_delta_rad=float(request.get("max_joint_delta_rad", 0.20)),
             )
+        if operation == "inject_next_restore_failure":
+            if not self.enable_restore_failure_injection:
+                raise PermissionError("Restore failure injection is disabled for this server.")
+            self.runtime.session.snapshot_manager.inject_restore_failure_once(
+                str(request.get("reason") or "real websocket transaction smoke")
+            )
+            return {"injected": True}
         raise ValueError(f"Unsupported agentic environment operation: {operation!r}.")
 
 
@@ -511,6 +589,9 @@ def main() -> None:
     )
     parser.add_argument("--hydra-override", action="append", default=[])
     parser.add_argument("--startup-report", type=Path)
+    parser.add_argument("--snapshot-dir", type=Path)
+    parser.add_argument("--import-snapshot-dir", type=Path, action="append", default=[])
+    parser.add_argument("--enable-restore-failure-injection", action="store_true")
     args = parser.parse_args()
     args.log_path.mkdir(parents=True, exist_ok=False)
     startup_report = args.startup_report or args.log_path.parent / "agentic_environment_startup.json"
@@ -525,6 +606,8 @@ def main() -> None:
             instance_id=args.instance_id,
             episode_id=args.episode_id,
             information_arm=args.information_arm,
+            snapshot_dir=args.snapshot_dir or args.log_path.parent / "snapshots",
+            snapshot_import_dirs=tuple(args.import_snapshot_dir),
         )
         _write_json_atomic(
             startup_report,
@@ -537,9 +620,16 @@ def main() -> None:
                 "information_arm": args.information_arm,
                 "available_modalities": runtime.metadata["available_modalities"],
                 "controller_manifest": runtime.controller_manifest.to_dict(),
+                "durable_snapshots": runtime.metadata["durable_snapshots"],
+                "imported_snapshot_count": runtime.metadata["imported_snapshot_count"],
             },
         )
-        AgenticEnvironmentWebsocketServer(runtime, host=args.host, port=args.port).serve_forever()
+        AgenticEnvironmentWebsocketServer(
+            runtime,
+            host=args.host,
+            port=args.port,
+            enable_restore_failure_injection=args.enable_restore_failure_injection,
+        ).serve_forever()
     except BaseException as exc:
         exit_code = 1
         report = {
