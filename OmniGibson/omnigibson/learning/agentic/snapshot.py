@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any, Protocol
 
 SNAPSHOT_SCHEMA_VERSION = 1
 PERSISTED_SNAPSHOT_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 class SnapshotError(RuntimeError):
@@ -366,6 +368,7 @@ class CompositeSnapshotManager:
             self.restore_diagnostic(phase, snapshot)
         except Exception:
             # Diagnostics must never alter restore semantics.
+            logger.exception("Snapshot restore diagnostic callback failed during %s.", phase)
             return
 
     def _restore_once(self, snapshot: CompositeSnapshot, *, started: float) -> RestoreReport:

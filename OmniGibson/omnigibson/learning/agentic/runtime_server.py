@@ -10,7 +10,9 @@ import http
 from inspect import getsourcefile
 import json
 import logging
+import os
 from pathlib import Path
+import time
 import traceback
 from typing import Any
 
@@ -103,6 +105,9 @@ class AgenticEvaluatorRuntime:
         self.instance_id = int(instance_id)
         self.episode_id = episode_id
         self.snapshot_dir = snapshot_dir
+        self.restore_diagnostic_path = (
+            snapshot_dir.parent / "restore_diagnostics.jsonl" if snapshot_dir is not None else None
+        )
         self.snapshot_import_dirs = snapshot_import_dirs
         self.evaluator = Evaluator(config)
         self.evaluator.reset()
@@ -406,6 +411,7 @@ class AgenticEvaluatorRuntime:
         position, orientation = radio.get_position_orientation()
         contact_bodies = radio.states[ContactBodies].get_value()
         details = {
+            "created_wall_time_ns": time.time_ns(),
             "phase": phase,
             "snapshot_id": snapshot.snapshot_id,
             "env_step": int(env._current_step),
@@ -421,6 +427,17 @@ class AgenticEvaluatorRuntime:
                 arm: getattr(obj, "name", None) for arm, obj in self.robot._ag_obj_in_hand.items()
             },
         }
+        if self.restore_diagnostic_path is not None:
+            self.restore_diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.restore_diagnostic_path.exists():
+                descriptor = os.open(
+                    self.restore_diagnostic_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.close(descriptor)
+            with self.restore_diagnostic_path.open("a", encoding="utf-8") as diagnostics:
+                diagnostics.write(json.dumps(details, sort_keys=True) + "\n")
         logger.info("agentic_radio_restore_diagnostic %s", json.dumps(details, sort_keys=True))
 
     def _propagate_once(self) -> dict[str, float]:
