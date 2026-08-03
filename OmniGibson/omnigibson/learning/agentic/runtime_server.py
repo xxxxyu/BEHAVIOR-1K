@@ -441,8 +441,8 @@ class AgenticEvaluatorRuntime:
             "linear_velocity": torch_to_numpy(radio.get_linear_velocity()),
             "angular_velocity": torch_to_numpy(radio.get_angular_velocity()),
             "on_table": bool(radio.states[OnTop].get_value(table)),
-            "grasping_left": bool(self.robot.is_grasping(arm="left", candidate_obj=radio)),
-            "grasping_right": bool(self.robot.is_grasping(arm="right", candidate_obj=radio)),
+            "grasping_left": int(self.robot.is_grasping(arm="left", candidate_obj=radio)) == 1,
+            "grasping_right": int(self.robot.is_grasping(arm="right", candidate_obj=radio)) == 1,
         }
 
     def _validate_demo_primary_checkpoint(self) -> None:
