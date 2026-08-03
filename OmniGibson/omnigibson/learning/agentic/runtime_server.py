@@ -27,6 +27,7 @@ from omnigibson.learning.agentic.environment_session import AgenticEnvironmentSe
 from omnigibson.learning.agentic.evaluator_state import EvaluatorSnapshotComponent
 from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_demo_primary_checkpoint
+from omnigibson.learning.agentic.retry_checkpoint import assess_radio_pickup_preclose_checkpoint
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
@@ -54,7 +55,8 @@ import websockets.asyncio.server as websocket_server
 logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 2
 CAMERA_POSE_KEY = "robot_r1::cam_rel_poses"
-CHECKPOINT_ROLES = frozenset({"general", "demo_primary", "direct_press_fallback"})
+RADIO_PICKUP_PRECLOSE_ROLE = "radio_pickup_preclose_right"
+CHECKPOINT_ROLES = frozenset({"general", "demo_primary", "direct_press_fallback", RADIO_PICKUP_PRECLOSE_ROLE})
 
 
 def _no_op_action(robot: object) -> np.ndarray:
@@ -98,6 +100,7 @@ class AgenticEvaluatorRuntime:
         information_arm: str = "vision_rgb",
         snapshot_dir: Path | None = None,
         snapshot_import_dirs: tuple[Path, ...] = (),
+        radio_pickup_fixture_reference_snapshot_id: str | None = None,
     ) -> None:
         if information_arm not in {"vision_rgb", "vision_rgb_depth"}:
             raise ValueError(f"Unsupported agentic information arm: {information_arm!r}.")
@@ -186,10 +189,16 @@ class AgenticEvaluatorRuntime:
             persist_snapshot(self.initial_snapshot, self.snapshot_dir)
         self.snapshot_roles = {self.initial_snapshot.snapshot_id: "initial"}
         self.demo_primary_snapshot_id: str | None = None
+        self.radio_pickup_preclose_snapshot_id: str | None = None
         self._initial_radio_checkpoint_state = (
             self._radio_checkpoint_state() if self.task_name == "turning_on_radio" else None
         )
+        self.radio_pickup_fixture_reference_snapshot_id = radio_pickup_fixture_reference_snapshot_id
+        self.radio_pickup_fixture_reference_restore_report = None
+        self._radio_pickup_fixture_reference_state: dict[str, object] | None = None
         self.imported_snapshot_count = self._load_imported_snapshots()
+        if self.radio_pickup_fixture_reference_snapshot_id is not None:
+            self._establish_radio_pickup_fixture_reference(self.radio_pickup_fixture_reference_snapshot_id)
         self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
 
     @property
@@ -225,6 +234,12 @@ class AgenticEvaluatorRuntime:
             "imported_snapshot_count": self.imported_snapshot_count,
             "checkpoint_roles": sorted(CHECKPOINT_ROLES),
             "demo_primary_integrity_tasks": ["turning_on_radio"],
+            "radio_pickup_fixture_reference_snapshot_id": self.radio_pickup_fixture_reference_snapshot_id,
+            "radio_pickup_fixture_reference_restore_report": (
+                self.radio_pickup_fixture_reference_restore_report.to_dict()
+                if self.radio_pickup_fixture_reference_restore_report is not None
+                else None
+            ),
         }
         if self.information_arm == "vision_rgb_depth":
             metadata["depth_keys"] = {
@@ -327,6 +342,10 @@ class AgenticEvaluatorRuntime:
             if self.demo_primary_snapshot_id is not None:
                 raise RuntimeError("The immutable demo_primary checkpoint is already established for this runtime.")
             self._validate_demo_primary_checkpoint()
+        if checkpoint_role == RADIO_PICKUP_PRECLOSE_ROLE:
+            if self.radio_pickup_preclose_snapshot_id is not None:
+                raise RuntimeError(f"The immutable {RADIO_PICKUP_PRECLOSE_ROLE} checkpoint is already established.")
+            self._validate_radio_pickup_preclose_checkpoint()
         self.session.pause()
         try:
             snapshot = self.session.snapshot(
@@ -341,6 +360,8 @@ class AgenticEvaluatorRuntime:
             self.snapshot_roles[snapshot.snapshot_id] = checkpoint_role
             if checkpoint_role == "demo_primary":
                 self.demo_primary_snapshot_id = snapshot.snapshot_id
+            if checkpoint_role == RADIO_PICKUP_PRECLOSE_ROLE:
+                self.radio_pickup_preclose_snapshot_id = snapshot.snapshot_id
         finally:
             self.session.resume()
         return {
@@ -444,6 +465,83 @@ class AgenticEvaluatorRuntime:
             "grasping_left": int(self.robot.is_grasping(arm="left", candidate_obj=radio)) == 1,
             "grasping_right": int(self.robot.is_grasping(arm="right", candidate_obj=radio)) == 1,
         }
+
+    def _radio_pickup_preclose_checkpoint_state(self) -> dict[str, object]:
+        env = self.evaluator.env
+        radio = _resolve_object(env, "radio_receiver.n.01_1").unwrapped
+        table = _resolve_object(env, "table.n.02_1").unwrapped
+        table_position, table_orientation = table.get_position_orientation()
+        base_position, base_orientation = self.robot.get_position_orientation()
+        contact_bodies = radio.states[ContactBodies].get_value()
+        table_links = getattr(table, "links", {})
+        link_values = table_links.values() if isinstance(table_links, Mapping) else table_links
+        progress = _normalize_task_progress(CHALLENGE_TASKS_PROGRESS_APPROXIMATION[self.task_name](env)) or {}
+        reference_action = normalize_runtime_reference_action(_no_op_action(self.robot), self.controller_manifest)
+        right_gripper = next(
+            segment for segment in self.controller_manifest.segments if segment.name == "gripper_right"
+        )
+        return {
+            **self._radio_checkpoint_state(),
+            "table_position": torch_to_numpy(table_position),
+            "table_orientation": torch_to_numpy(table_orientation),
+            "table_linear_velocity": torch_to_numpy(table.get_linear_velocity()),
+            "table_angular_velocity": torch_to_numpy(table.get_angular_velocity()),
+            "base_position": torch_to_numpy(base_position),
+            "base_orientation": torch_to_numpy(base_orientation),
+            "base_linear_velocity": torch_to_numpy(self.robot.get_linear_velocity()),
+            "base_angular_velocity": torch_to_numpy(self.robot.get_angular_velocity()),
+            "contact_body_paths": sorted(str(getattr(body, "prim_path", body)) for body in contact_bodies),
+            "table_link_paths": sorted(str(getattr(link, "prim_path", link)) for link in link_values),
+            "assisted_grasp_attachments": {
+                arm: getattr(obj, "name", None) for arm, obj in self.robot._ag_obj_in_hand.items()
+            },
+            "robot_near_radio": bool(progress.get("robot_near_radio", False)),
+            "radio_picked_up": bool(progress.get("radio_picked_up", False)),
+            "radio_on": bool(progress.get("radio_on", False)),
+            "right_gripper_command": float(reference_action[right_gripper.start]),
+        }
+
+    def _establish_radio_pickup_fixture_reference(self, snapshot_id: str) -> None:
+        if self.task_name != "turning_on_radio":
+            raise ValueError("Radio pickup fixture references are valid only for turning_on_radio.")
+        try:
+            snapshot = self.snapshots[snapshot_id]
+        except KeyError as exc:
+            raise ValueError(f"Unknown Radio pickup fixture reference snapshot: {snapshot_id}.") from exc
+        if self.snapshot_roles.get(snapshot_id) != "imported":
+            raise ValueError("Radio pickup fixture reference must be an explicitly imported snapshot.")
+        self.session.pause()
+        try:
+            report = self.session.restore(snapshot)
+        finally:
+            self.session.resume()
+        self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
+        self.radio_pickup_fixture_reference_restore_report = report
+        self._radio_pickup_fixture_reference_state = self._radio_pickup_preclose_checkpoint_state()
+
+    def _validate_radio_pickup_preclose_checkpoint(self) -> None:
+        if self.task_name != "turning_on_radio" or self._radio_pickup_fixture_reference_state is None:
+            raise RuntimeError(f"{RADIO_PICKUP_PRECLOSE_ROLE} requires a source-pinned imported reference snapshot.")
+        candidate = self._radio_pickup_preclose_checkpoint_state()
+        assessment = assess_radio_pickup_preclose_checkpoint(
+            self._radio_pickup_fixture_reference_state,
+            candidate,
+        )
+        details = {
+            "created_wall_time_ns": time.time_ns(),
+            "phase": "radio_pickup_preclose_checkpoint_validation",
+            "env_step": int(self.evaluator.env._current_step),
+            "reference_snapshot_id": self.radio_pickup_fixture_reference_snapshot_id,
+            "assessment": assessment,
+            "reference": _jsonable(self._radio_pickup_fixture_reference_state),
+            "candidate": _jsonable(candidate),
+        }
+        self._append_private_diagnostic("checkpoint_integrity.jsonl", details)
+        if not bool(assessment["accepted"]):
+            raise RuntimeError(
+                f"{RADIO_PICKUP_PRECLOSE_ROLE} checkpoint integrity failed; rebuild from the pinned seed and "
+                "replay prefix before saving."
+            )
 
     def _validate_demo_primary_checkpoint(self) -> None:
         if self.task_name != "turning_on_radio" or self._initial_radio_checkpoint_state is None:
@@ -685,6 +783,7 @@ def main() -> None:
     parser.add_argument("--startup-report", type=Path)
     parser.add_argument("--snapshot-dir", type=Path)
     parser.add_argument("--import-snapshot-dir", type=Path, action="append", default=[])
+    parser.add_argument("--radio-pickup-fixture-reference-snapshot-id")
     parser.add_argument("--enable-restore-failure-injection", action="store_true")
     args = parser.parse_args()
     args.log_path.mkdir(parents=True, exist_ok=False)
@@ -702,6 +801,7 @@ def main() -> None:
             information_arm=args.information_arm,
             snapshot_dir=args.snapshot_dir or args.log_path.parent / "snapshots",
             snapshot_import_dirs=tuple(args.import_snapshot_dir),
+            radio_pickup_fixture_reference_snapshot_id=args.radio_pickup_fixture_reference_snapshot_id,
         )
         _write_json_atomic(
             startup_report,
@@ -716,6 +816,9 @@ def main() -> None:
                 "controller_manifest": runtime.controller_manifest.to_dict(),
                 "durable_snapshots": runtime.metadata["durable_snapshots"],
                 "imported_snapshot_count": runtime.metadata["imported_snapshot_count"],
+                "radio_pickup_fixture_reference_snapshot_id": runtime.metadata[
+                    "radio_pickup_fixture_reference_snapshot_id"
+                ],
             },
         )
         AgenticEnvironmentWebsocketServer(
