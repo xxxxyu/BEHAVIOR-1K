@@ -26,6 +26,7 @@ from omnigibson.learning.agentic.controller_manifest import validate_r1pro_manif
 from omnigibson.learning.agentic.environment_session import AgenticEnvironmentSession
 from omnigibson.learning.agentic.evaluator_state import EvaluatorSnapshotComponent
 from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
+from omnigibson.learning.agentic.retry_checkpoint import assess_radio_demo_primary_checkpoint
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
@@ -53,6 +54,7 @@ import websockets.asyncio.server as websocket_server
 logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 2
 CAMERA_POSE_KEY = "robot_r1::cam_rel_poses"
+CHECKPOINT_ROLES = frozenset({"general", "demo_primary", "direct_press_fallback"})
 
 
 def _no_op_action(robot: object) -> np.ndarray:
@@ -182,6 +184,11 @@ class AgenticEvaluatorRuntime:
             self.session.resume()
         if self.snapshot_dir is not None:
             persist_snapshot(self.initial_snapshot, self.snapshot_dir)
+        self.snapshot_roles = {self.initial_snapshot.snapshot_id: "initial"}
+        self.demo_primary_snapshot_id: str | None = None
+        self._initial_radio_checkpoint_state = (
+            self._radio_checkpoint_state() if self.task_name == "turning_on_radio" else None
+        )
         self.imported_snapshot_count = self._load_imported_snapshots()
         self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
 
@@ -216,6 +223,8 @@ class AgenticEvaluatorRuntime:
             "available_modalities": ["rgb", "proprio"],
             "durable_snapshots": self.snapshot_dir is not None,
             "imported_snapshot_count": self.imported_snapshot_count,
+            "checkpoint_roles": sorted(CHECKPOINT_ROLES),
+            "demo_primary_integrity_tasks": ["turning_on_radio"],
         }
         if self.information_arm == "vision_rgb_depth":
             metadata["depth_keys"] = {
@@ -306,7 +315,18 @@ class AgenticEvaluatorRuntime:
         payload["executed_action"] = result.executed_action
         return payload
 
-    def snapshot(self, *, parent_snapshot_id: str | None = None) -> dict[str, object]:
+    def snapshot(
+        self,
+        *,
+        parent_snapshot_id: str | None = None,
+        checkpoint_role: str = "general",
+    ) -> dict[str, object]:
+        if checkpoint_role not in CHECKPOINT_ROLES:
+            raise ValueError(f"Unsupported checkpoint role: {checkpoint_role!r}.")
+        if checkpoint_role == "demo_primary":
+            if self.demo_primary_snapshot_id is not None:
+                raise RuntimeError("The immutable demo_primary checkpoint is already established for this runtime.")
+            self._validate_demo_primary_checkpoint()
         self.session.pause()
         try:
             snapshot = self.session.snapshot(
@@ -318,9 +338,16 @@ class AgenticEvaluatorRuntime:
             if self.snapshot_dir is not None:
                 persist_snapshot(snapshot, self.snapshot_dir)
             self.snapshots[snapshot.snapshot_id] = snapshot
+            self.snapshot_roles[snapshot.snapshot_id] = checkpoint_role
+            if checkpoint_role == "demo_primary":
+                self.demo_primary_snapshot_id = snapshot.snapshot_id
         finally:
             self.session.resume()
-        return {"snapshot_id": snapshot.snapshot_id, "metadata": snapshot.metadata.to_dict()}
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "metadata": snapshot.metadata.to_dict(),
+            "checkpoint_role": checkpoint_role,
+        }
 
     def restore(self, snapshot_id: str) -> dict[str, object]:
         try:
@@ -399,8 +426,55 @@ class AgenticEvaluatorRuntime:
                     )
                 if snapshot.snapshot_id not in self.snapshots:
                     self.snapshots[snapshot.snapshot_id] = snapshot
+                    self.snapshot_roles[snapshot.snapshot_id] = "imported"
                     imported += 1
         return imported
+
+    def _radio_checkpoint_state(self) -> dict[str, object]:
+        env = self.evaluator.env
+        radio = _resolve_object(env, "radio_receiver.n.01_1").unwrapped
+        table = _resolve_object(env, "table.n.02_1").unwrapped
+        position, orientation = radio.get_position_orientation()
+        return {
+            "position": torch_to_numpy(position),
+            "orientation": torch_to_numpy(orientation),
+            "linear_velocity": torch_to_numpy(radio.get_linear_velocity()),
+            "angular_velocity": torch_to_numpy(radio.get_angular_velocity()),
+            "on_table": bool(radio.states[OnTop].get_value(table)),
+            "grasping_left": bool(self.robot.is_grasping(arm="left", candidate_obj=radio)),
+            "grasping_right": bool(self.robot.is_grasping(arm="right", candidate_obj=radio)),
+        }
+
+    def _validate_demo_primary_checkpoint(self) -> None:
+        if self.task_name != "turning_on_radio" or self._initial_radio_checkpoint_state is None:
+            return
+        candidate = self._radio_checkpoint_state()
+        assessment = assess_radio_demo_primary_checkpoint(self._initial_radio_checkpoint_state, candidate)
+        details = {
+            "created_wall_time_ns": time.time_ns(),
+            "phase": "demo_primary_checkpoint_validation",
+            "env_step": int(self.evaluator.env._current_step),
+            "assessment": assessment,
+            "initial": _jsonable(self._initial_radio_checkpoint_state),
+            "candidate": _jsonable(candidate),
+        }
+        self._append_private_diagnostic("checkpoint_integrity.jsonl", details)
+        if not bool(assessment["accepted"]):
+            raise RuntimeError(
+                "demo_primary checkpoint integrity failed; restore the initial state and approach without contacting "
+                "the Radio before saving the primary checkpoint."
+            )
+
+    def _append_private_diagnostic(self, filename: str, details: Mapping[str, object]) -> None:
+        if self.snapshot_dir is None:
+            return
+        path = self.snapshot_dir.parent / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+        with path.open("a", encoding="utf-8") as diagnostics:
+            diagnostics.write(json.dumps(_jsonable(details), sort_keys=True) + "\n")
 
     def _log_restore_diagnostic(self, phase: str, snapshot: CompositeSnapshot) -> None:
         if self.task_name != "turning_on_radio":
@@ -533,7 +607,10 @@ class AgenticEnvironmentWebsocketServer:
             return self.runtime.step(request.get("action"))
         if operation == "snapshot":
             parent = request.get("parent_snapshot_id")
-            return self.runtime.snapshot(parent_snapshot_id=str(parent) if parent else None)
+            return self.runtime.snapshot(
+                parent_snapshot_id=str(parent) if parent else None,
+                checkpoint_role=str(request.get("checkpoint_role") or "general"),
+            )
         if operation == "restore":
             return self.runtime.restore(str(request.get("snapshot_id")))
         if operation == "finish":
