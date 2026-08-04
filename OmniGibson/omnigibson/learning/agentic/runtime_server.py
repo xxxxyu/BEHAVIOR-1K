@@ -25,6 +25,7 @@ from omnigibson.learning.agentic.controller_manifest import normalize_runtime_re
 from omnigibson.learning.agentic.controller_manifest import validate_r1pro_manifest
 from omnigibson.learning.agentic.environment_session import AgenticEnvironmentSession
 from omnigibson.learning.agentic.evaluator_state import EvaluatorSnapshotComponent
+from omnigibson.learning.agentic.kinematics import bounded_pose_delta_ik_step
 from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_demo_primary_checkpoint
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_pickup_preclose_checkpoint
@@ -288,6 +289,58 @@ class AgenticEvaluatorRuntime:
             "orientation_policy": "keep_current_orientation_local_linearization",
             "collision_checked": False,
             **_jsonable(result),
+        }
+
+    def plan_eef_pose_delta(
+        self,
+        *,
+        arm: str,
+        target_position: object,
+        orientation_delta_eef_axis_angle_rad: object,
+        max_target_delta_m: float = 0.03,
+        max_orientation_delta_rad: float = 0.17,
+        max_joint_delta_rad: float = 0.12,
+    ) -> dict[str, object]:
+        """Return one bounded local pose-delta IK target without executing."""
+
+        if arm not in {"left", "right"}:
+            raise ValueError("arm must be 'left' or 'right'.")
+        if not np.isfinite(max_target_delta_m) or not 0 < max_target_delta_m <= 0.05:
+            raise ValueError("max_target_delta_m must be within (0, 0.05].")
+        if not np.isfinite(max_orientation_delta_rad) or not 0 < max_orientation_delta_rad <= 0.35:
+            raise ValueError("max_orientation_delta_rad must be within (0, 0.35].")
+        if not np.isfinite(max_joint_delta_rad) or not 0 < max_joint_delta_rad <= 0.35:
+            raise ValueError("max_joint_delta_rad must be within (0, 0.35].")
+        controller = self.robot.controllers[f"arm_{arm}"]
+        control_dict = self.robot.get_control_dict()
+        dof_indices = np.asarray(controller.dof_idx, dtype=np.int64)
+        lower_all, upper_all = controller._control_limits[controller.control_type]
+        result = bounded_pose_delta_ik_step(
+            joint_positions=torch_to_numpy(control_dict["joint_position"])[dof_indices],
+            jacobian=torch_to_numpy(control_dict[f"eef_{arm}_jacobian_relative"][:, dof_indices]),
+            eef_position=torch_to_numpy(control_dict[f"eef_{arm}_pos_relative"]),
+            eef_quaternion_xyzw=torch_to_numpy(control_dict[f"eef_{arm}_quat_relative"]),
+            target_position=np.asarray(target_position, dtype=np.float32),
+            orientation_delta_eef_axis_angle_rad=np.asarray(orientation_delta_eef_axis_angle_rad, dtype=np.float32),
+            joint_lower=torch_to_numpy(lower_all)[dof_indices],
+            joint_upper=torch_to_numpy(upper_all)[dof_indices],
+            max_target_delta_m=max_target_delta_m,
+            max_orientation_delta_rad=max_orientation_delta_rad,
+            max_joint_delta_rad=max_joint_delta_rad,
+        )
+        result.pop("target_eef_quaternion_robot_xyzw")
+        return {
+            "arm": arm,
+            "controller_segment": f"arm_{arm}",
+            **_jsonable(result),
+            "frame_policy": {
+                "orientation_policy": "bounded_eef_frame_pose_delta",
+                "quaternion_order": "xyzw",
+                "composition": "q_target_robot = q_current_robot * q_delta_eef",
+                "jacobian_angular_error_frame": "robot_base",
+                "quaternion_sign_policy": "normalized_shortest_arc_nonnegative_w",
+            },
+            "collision_checked": False,
         }
 
     def observe(self) -> dict[str, object]:
@@ -722,6 +775,15 @@ class AgenticEnvironmentWebsocketServer:
                 target_position=request.get("target_position"),
                 max_target_delta_m=float(request.get("max_target_delta_m", 0.12)),
                 max_joint_delta_rad=float(request.get("max_joint_delta_rad", 0.20)),
+            )
+        if operation == "plan_eef_pose_delta":
+            return self.runtime.plan_eef_pose_delta(
+                arm=str(request.get("arm")),
+                target_position=request.get("target_position"),
+                orientation_delta_eef_axis_angle_rad=request.get("orientation_delta_eef_axis_angle_rad"),
+                max_target_delta_m=float(request.get("max_target_delta_m", 0.03)),
+                max_orientation_delta_rad=float(request.get("max_orientation_delta_rad", 0.17)),
+                max_joint_delta_rad=float(request.get("max_joint_delta_rad", 0.12)),
             )
         if operation == "inject_next_restore_failure":
             if not self.enable_restore_failure_injection:
