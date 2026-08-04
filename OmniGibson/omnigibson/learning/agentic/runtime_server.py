@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Mapping
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 import hashlib
 import http
 from inspect import getsourcefile
@@ -12,9 +14,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
+import signal
+import threading
 import time
 import traceback
-from typing import Any
+from typing import Any, Callable
 
 import hydra
 import numpy as np
@@ -58,6 +63,11 @@ PROTOCOL_VERSION = 2
 CAMERA_POSE_KEY = "robot_r1::cam_rel_poses"
 RADIO_PICKUP_PRECLOSE_ROLE = "radio_pickup_preclose_right"
 CHECKPOINT_ROLES = frozenset({"general", "demo_primary", "direct_press_fallback", RADIO_PICKUP_PRECLOSE_ROLE})
+REQUEST_QUEUE_CAPACITY = 1
+REQUEST_TIMEOUT_SECONDS = 300.0
+NETWORK_STARTUP_TIMEOUT_SECONDS = 10.0
+NETWORK_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+DISPATCH_POLL_SECONDS = 0.05
 
 
 def _no_op_action(robot: object) -> np.ndarray:
@@ -691,27 +701,237 @@ class AgenticEvaluatorRuntime:
         return f"obs-{int(self.evaluator.env._current_step)}-{hasher.hexdigest()[:16]}"
 
 
-class AgenticEnvironmentWebsocketServer:
+class RequestBridgeError(RuntimeError):
+    """Base class for failures that close the request bridge."""
+
+
+class RequestQueueFullError(RequestBridgeError):
+    pass
+
+
+class RequestTimeoutError(RequestBridgeError):
+    pass
+
+
+class DuplicateCompletionError(RequestBridgeError):
+    pass
+
+
+class RequestBridgeShutdownError(RequestBridgeError):
+    pass
+
+
+class NetworkThreadError(RequestBridgeError):
+    pass
+
+
+class NetworkStartupError(NetworkThreadError):
+    pass
+
+
+@dataclass(frozen=True, eq=False)
+class RequestEnvelope:
+    """Immutable request bytes paired with one thread-safe response channel."""
+
+    payload: bytes
+    response: Future[bytes] = field(default_factory=Future, repr=False, compare=False)
+    _completion_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def complete(self, response: bytes) -> None:
+        with self._completion_lock:
+            if self.response.done():
+                raise DuplicateCompletionError("A runtime request response was completed more than once.")
+            self.response.set_result(response)
+
+    def fail(self, error: RequestBridgeError) -> None:
+        with self._completion_lock:
+            if self.response.done():
+                raise DuplicateCompletionError("A runtime request response was completed more than once.")
+            self.response.set_exception(error)
+
+
+class RequestBridge:
+    """Single-consumer bounded handoff between network and runtime threads."""
+
+    def __init__(self, capacity: int = REQUEST_QUEUE_CAPACITY) -> None:
+        if capacity <= 0:
+            raise ValueError("Request queue capacity must be positive.")
+        self._queue: queue.Queue[RequestEnvelope] = queue.Queue(maxsize=capacity)
+        self._lock = threading.Lock()
+        self._pending: set[RequestEnvelope] = set()
+        self._closed = threading.Event()
+        self._close_reason: RequestBridgeError | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    @property
+    def close_reason(self) -> RequestBridgeError | None:
+        with self._lock:
+            return self._close_reason
+
+    def submit(self, payload: bytes) -> RequestEnvelope:
+        envelope = RequestEnvelope(payload=payload)
+        queue_error = None
+        with self._lock:
+            if self._closed.is_set():
+                raise self._close_reason or RequestBridgeShutdownError("The runtime request bridge is closed.")
+            try:
+                self._queue.put_nowait(envelope)
+                self._pending.add(envelope)
+            except queue.Full:
+                queue_error = RequestQueueFullError("The runtime request queue is full.")
+        if queue_error is not None:
+            self.close(queue_error)
+            raise queue_error
+        return envelope
+
+    def get(self, timeout: float) -> RequestEnvelope | None:
+        if self._closed.is_set():
+            return None
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def complete(self, envelope: RequestEnvelope, response: bytes) -> None:
+        with self._lock:
+            try:
+                envelope.complete(response)
+            except DuplicateCompletionError as exc:
+                if not self._closed.is_set():
+                    self._close_reason = exc
+                    self._closed.set()
+                    for pending_envelope in self._pending:
+                        if pending_envelope is not envelope:
+                            pending_envelope.fail(exc)
+                    self._pending.clear()
+                raise
+            self._pending.discard(envelope)
+
+    def close(self, reason: RequestBridgeError) -> None:
+        with self._lock:
+            if self._closed.is_set():
+                return
+            self._close_reason = reason
+            self._closed.set()
+            for envelope in self._pending:
+                envelope.fail(reason)
+            self._pending.clear()
+
+
+def _error_payload(exc: BaseException) -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": {"type": type(exc).__name__, "message": str(exc)},
+    }
+
+
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+class _WebsocketNetworkWorker:
+    """Owns websocket and asyncio state without retaining the simulator runtime."""
+
     def __init__(
         self,
-        runtime: AgenticEvaluatorRuntime,
         *,
         host: str,
         port: int,
-        enable_restore_failure_injection: bool = False,
+        metadata_frame: bytes,
+        bridge: RequestBridge,
+        request_timeout: float,
     ) -> None:
-        if host not in {"127.0.0.1", "localhost", "::1"}:
-            raise ValueError("The initial agentic environment service must bind only to loopback.")
-        self.runtime = runtime
         self.host = host
         self.port = port
-        self.enable_restore_failure_injection = enable_restore_failure_injection
+        self.bridge = bridge
+        self.request_timeout = request_timeout
+        self.bound_port: int | None = None
+        self.thread_ident: int | None = None
+        self._thread = threading.Thread(target=self._thread_main, name="agentic-websocket-network", daemon=False)
+        self._ready = threading.Event()
+        self._expected_shutdown = threading.Event()
+        self._failure_lock = threading.Lock()
+        self._failure: BaseException | None = None
+        self._metadata_lock = threading.Lock()
+        self._metadata_frame = metadata_frame
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown_event: asyncio.Event | None = None
+        self._client_lock: asyncio.Lock | None = None
+
+    @property
+    def failure(self) -> BaseException | None:
+        with self._failure_lock:
+            return self._failure
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def update_metadata(self, metadata_frame: bytes) -> None:
+        with self._metadata_lock:
+            self._metadata_frame = metadata_frame
+
+    def _current_metadata(self) -> bytes:
+        with self._metadata_lock:
+            return self._metadata_frame
+
+    def start(self, timeout: float = NETWORK_STARTUP_TIMEOUT_SECONDS) -> None:
+        self._thread.start()
+        if not self._ready.wait(timeout):
+            error = NetworkStartupError("Timed out waiting for the websocket network thread to bind.")
+            self._record_failure(error)
+            self.stop()
+            self.join()
+            raise error
+        if self.failure is not None or not self._thread.is_alive() or self.bound_port is None:
+            raise NetworkStartupError("The websocket network thread failed during startup.") from self.failure
+
+    def stop(self) -> None:
+        self._expected_shutdown.set()
+        loop = self._loop
+        shutdown_event = self._shutdown_event
+        if loop is not None and shutdown_event is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(shutdown_event.set)
+
+    def join(self, timeout: float = NETWORK_SHUTDOWN_TIMEOUT_SECONDS) -> None:
+        if self._thread.ident is None or threading.get_ident() == self._thread.ident:
+            return
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise NetworkThreadError("The websocket network thread did not stop cleanly.")
+
+    def _record_failure(self, exc: BaseException) -> None:
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = exc
+        reason = exc if isinstance(exc, RequestBridgeError) else NetworkThreadError(str(exc))
+        self.bridge.close(reason)
+        loop = self._loop
+        shutdown_event = self._shutdown_event
+        if loop is not None and shutdown_event is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(shutdown_event.set)
+
+    def _thread_main(self) -> None:
+        self.thread_ident = threading.get_ident()
+        try:
+            asyncio.run(self._run())
+            if not self._expected_shutdown.is_set() and self.failure is None:
+                self._record_failure(NetworkThreadError("The websocket network thread stopped unexpectedly."))
+        except BaseException as exc:
+            self._record_failure(exc)
+        finally:
+            self._ready.set()
+
+    async def _run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._shutdown_event = asyncio.Event()
         self._client_lock = asyncio.Lock()
-
-    def serve_forever(self) -> None:
-        asyncio.run(self.run())
-
-    async def run(self) -> None:
+        if self._expected_shutdown.is_set():
+            self._shutdown_event.set()
         async with websocket_server.serve(
             self._handler,
             self.host,
@@ -720,37 +940,181 @@ class AgenticEnvironmentWebsocketServer:
             max_size=None,
             process_request=_health_check,
         ) as server:
-            logger.info("Agentic BEHAVIOR environment listening on %s:%s", self.host, self.port)
-            await server.serve_forever()
+            sockets = server.sockets
+            if not sockets:
+                raise NetworkStartupError("The websocket server did not create a listening socket.")
+            self.bound_port = int(sockets[0].getsockname()[1])
+            logger.info("Agentic BEHAVIOR environment listening on %s:%s", self.host, self.bound_port)
+            self._ready.set()
+            await self._shutdown_event.wait()
 
     async def _handler(self, websocket: websocket_server.ServerConnection) -> None:
+        if self._client_lock is None:
+            raise NetworkThreadError("The websocket client lock was not initialized.")
         if self._client_lock.locked():
             await websocket.close(code=1013, reason="Agentic environment already has an active controller.")
             return
         async with self._client_lock:
             packer = Packer()
-            await websocket.send(packer.pack(self.runtime.metadata))
+            await websocket.send(self._current_metadata())
             while True:
                 try:
-                    request = unpackb(await websocket.recv(), strict_map_key=False)
+                    message = await websocket.recv()
+                except websockets.ConnectionClosed:
+                    break
+                try:
+                    payload = bytes(message)
+                    request = unpackb(payload, strict_map_key=False)
                     if not isinstance(request, dict):
                         raise ValueError("Agentic environment request must be an object.")
-                    result = self._dispatch(request)
-                    await websocket.send(packer.pack({"ok": True, "result": result}))
-                except websockets.ConnectionClosed:
+                    envelope = self.bridge.submit(payload)
+                except RequestBridgeError as exc:
+                    await self._send_fatal_error(websocket, packer, exc)
                     break
                 except Exception as exc:
                     logger.error("Agentic environment request failed:\n%s", traceback.format_exc())
-                    await websocket.send(
-                        packer.pack(
-                            {
-                                "ok": False,
-                                "error": {"type": type(exc).__name__, "message": str(exc)},
-                            }
-                        )
-                    )
+                    try:
+                        await websocket.send(packer.pack(_error_payload(exc)))
+                    except websockets.ConnectionClosed:
+                        break
+                    continue
 
-    def _dispatch(self, request: dict[str, object]) -> dict[str, object]:
+                try:
+                    response_waiter = asyncio.wrap_future(envelope.response)
+                    response_waiter.add_done_callback(_consume_future_exception)
+                    response = await asyncio.wait_for(
+                        asyncio.shield(response_waiter),
+                        timeout=self.request_timeout,
+                    )
+                    await websocket.send(response)
+                except asyncio.TimeoutError:
+                    error = RequestTimeoutError(
+                        f"Runtime request did not complete within {self.request_timeout:g} seconds."
+                    )
+                    self.bridge.close(error)
+                    await self._send_fatal_error(websocket, packer, error)
+                    break
+                except RequestBridgeError as exc:
+                    await self._send_fatal_error(websocket, packer, exc)
+                    break
+                except websockets.ConnectionClosed:
+                    break
+
+    async def _send_fatal_error(
+        self,
+        websocket: websocket_server.ServerConnection,
+        packer: Any,
+        exc: RequestBridgeError,
+    ) -> None:
+        if not isinstance(exc, RequestBridgeShutdownError):
+            self._record_failure(exc)
+        try:
+            await websocket.send(packer.pack(_error_payload(exc)))
+            await websocket.close(code=1011, reason="Agentic runtime bridge closed.")
+        except websockets.ConnectionClosed:
+            pass
+
+
+class AgenticEnvironmentWebsocketServer:
+    def __init__(
+        self,
+        runtime: AgenticEvaluatorRuntime,
+        *,
+        host: str,
+        port: int,
+        enable_restore_failure_injection: bool = False,
+        request_queue_capacity: int = REQUEST_QUEUE_CAPACITY,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("The initial agentic environment service must bind only to loopback.")
+        if request_timeout <= 0:
+            raise ValueError("Request timeout must be positive.")
+        self.runtime = runtime
+        self.host = host
+        self.port = port
+        self.enable_restore_failure_injection = enable_restore_failure_injection
+        self._bridge = RequestBridge(request_queue_capacity)
+        self._response_packer = Packer()
+        self._network = _WebsocketNetworkWorker(
+            host=host,
+            port=port,
+            metadata_frame=self._response_packer.pack(runtime.metadata),
+            bridge=self._bridge,
+            request_timeout=request_timeout,
+        )
+        self._shutdown_lock = threading.Lock()
+        self._shutdown = False
+
+    @property
+    def bound_port(self) -> int | None:
+        return self._network.bound_port
+
+    @property
+    def network_thread_ident(self) -> int | None:
+        return self._network.thread_ident
+
+    def serve_forever(self, on_ready: Callable[[], None] | None = None) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("The agentic runtime dispatch loop must run on the process main thread.")
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RequestBridgeShutdownError("The runtime request bridge is already shut down.")
+        try:
+            self._network.start()
+            if on_ready is not None:
+                on_ready()
+            self._dispatch_forever()
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        with self._shutdown_lock:
+            first_shutdown = not self._shutdown
+            self._shutdown = True
+        if first_shutdown:
+            self._bridge.close(RequestBridgeShutdownError("The runtime request bridge is shutting down."))
+        self._network.stop()
+        self._network.join()
+
+    def _dispatch_forever(self) -> None:
+        while not self._bridge.closed:
+            failure = self._network.failure
+            if failure is not None:
+                raise NetworkThreadError("The websocket network thread failed.") from failure
+            if not self._network.is_alive:
+                raise NetworkThreadError("The websocket network thread stopped unexpectedly.")
+            envelope = self._bridge.get(DISPATCH_POLL_SECONDS)
+            if envelope is None:
+                continue
+            self._dispatch_envelope(envelope)
+        reason = self._bridge.close_reason
+        if reason is not None and not isinstance(reason, RequestBridgeShutdownError):
+            raise NetworkThreadError("The websocket runtime bridge failed closed.") from reason
+
+    def _dispatch_envelope(self, envelope: RequestEnvelope) -> None:
+        try:
+            request = unpackb(envelope.payload, strict_map_key=False)
+            if not isinstance(request, dict):
+                raise ValueError("Agentic environment request must be an object.")
+            result = self._dispatch(request)
+            response = self._response_packer.pack({"ok": True, "result": result})
+        except Exception as exc:
+            logger.error("Agentic environment request failed:\n%s", traceback.format_exc())
+            response = self._response_packer.pack(_error_payload(exc))
+        try:
+            self._network.update_metadata(self._response_packer.pack(self.runtime.metadata))
+        except Exception as exc:
+            error = RequestBridgeError(f"Failed to refresh runtime metadata: {exc}")
+            self._bridge.close(error)
+            raise NetworkThreadError("The websocket runtime bridge failed closed on metadata refresh.") from exc
+        try:
+            self._bridge.complete(envelope, response)
+        except DuplicateCompletionError as exc:
+            self._bridge.close(exc)
+            raise NetworkThreadError("The websocket runtime bridge failed closed on duplicate completion.") from exc
+
+    def _dispatch(self, request: Mapping[str, object]) -> dict[str, object]:
         operation = request.get("operation")
         if operation == "observe":
             return self.runtime.observe()
@@ -827,6 +1191,10 @@ def _compose_config(args: argparse.Namespace) -> object:
     return config
 
 
+def _raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", default="turning_on_radio")
@@ -854,7 +1222,9 @@ def main() -> None:
     config = _compose_config(args)
     gm.HEADLESS = bool(config.headless)
     runtime = None
+    server = None
     exit_code = 0
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
         runtime = AgenticEvaluatorRuntime(
             config,
@@ -865,30 +1235,34 @@ def main() -> None:
             snapshot_import_dirs=tuple(args.import_snapshot_dir),
             radio_pickup_fixture_reference_snapshot_id=args.radio_pickup_fixture_reference_snapshot_id,
         )
-        _write_json_atomic(
-            startup_report,
-            {
-                "status": "ready",
-                "task": args.task,
-                "instance_id": args.instance_id,
-                "host": args.host,
-                "port": args.port,
-                "information_arm": args.information_arm,
-                "available_modalities": runtime.metadata["available_modalities"],
-                "controller_manifest": runtime.controller_manifest.to_dict(),
-                "durable_snapshots": runtime.metadata["durable_snapshots"],
-                "imported_snapshot_count": runtime.metadata["imported_snapshot_count"],
-                "radio_pickup_fixture_reference_snapshot_id": runtime.metadata[
-                    "radio_pickup_fixture_reference_snapshot_id"
-                ],
-            },
-        )
-        AgenticEnvironmentWebsocketServer(
+        server = AgenticEnvironmentWebsocketServer(
             runtime,
             host=args.host,
             port=args.port,
             enable_restore_failure_injection=args.enable_restore_failure_injection,
-        ).serve_forever()
+        )
+
+        def write_ready_report() -> None:
+            _write_json_atomic(
+                startup_report,
+                {
+                    "status": "ready",
+                    "task": args.task,
+                    "instance_id": args.instance_id,
+                    "host": args.host,
+                    "port": args.port,
+                    "information_arm": args.information_arm,
+                    "available_modalities": runtime.metadata["available_modalities"],
+                    "controller_manifest": runtime.controller_manifest.to_dict(),
+                    "durable_snapshots": runtime.metadata["durable_snapshots"],
+                    "imported_snapshot_count": runtime.metadata["imported_snapshot_count"],
+                    "radio_pickup_fixture_reference_snapshot_id": runtime.metadata[
+                        "radio_pickup_fixture_reference_snapshot_id"
+                    ],
+                },
+            )
+
+        server.serve_forever(on_ready=write_ready_report)
     except BaseException as exc:
         exit_code = 1
         report = {
@@ -902,9 +1276,12 @@ def main() -> None:
         _write_json_atomic(startup_report, report)
         print(json.dumps(report, indent=2, sort_keys=True), flush=True)
     finally:
+        if server is not None:
+            server.shutdown()
         if runtime is not None:
             runtime.close()
         og.shutdown()
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
     if exit_code:
         raise SystemExit(exit_code)
 

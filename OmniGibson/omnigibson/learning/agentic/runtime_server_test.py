@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+from http.client import HTTPConnection
+import socket
+import threading
+import time
 
 import numpy as np
 import pytest
+import websockets
+from websockets.sync.client import connect
 
 from omnigibson.learning.agentic.runtime_server import AgenticEnvironmentWebsocketServer
 from omnigibson.learning.agentic.runtime_server import AgenticEvaluatorRuntime
+from omnigibson.learning.agentic.runtime_server import DuplicateCompletionError
+from omnigibson.learning.agentic.runtime_server import NetworkStartupError
+from omnigibson.learning.agentic.runtime_server import NetworkThreadError
+from omnigibson.learning.agentic.runtime_server import RequestBridge
+from omnigibson.learning.agentic.runtime_server import RequestBridgeShutdownError
+from omnigibson.learning.agentic.runtime_server import RequestQueueFullError
+from omnigibson.learning.utils.network_utils import Packer
+from omnigibson.learning.utils.network_utils import unpackb
 
 
 class _FakeController:
@@ -133,3 +148,245 @@ def test_plan_eef_pose_delta_websocket_dispatch_calls_planner_without_action():
             "max_joint_delta_rad": 0.12,
         }
     ]
+
+
+class _FakeBridgeRuntime:
+    def __init__(self) -> None:
+        self.metadata_threads: list[int] = []
+        self.dispatch_threads: list[int] = []
+        self.steps: list[object] = []
+
+    @property
+    def metadata(self):
+        self.metadata_threads.append(threading.get_ident())
+        return {
+            "service": "test_agentic_environment",
+            "protocol_version": 2,
+            "completed_steps": len(self.steps),
+        }
+
+    def observe(self):
+        self.dispatch_threads.append(threading.get_ident())
+        return {"sequence": len(self.dispatch_threads)}
+
+    def step(self, action):
+        self.dispatch_threads.append(threading.get_ident())
+        self.steps.append(action)
+        return {"action": action}
+
+
+def _serve_with_client(server, client):
+    ready = threading.Event()
+    client_error = []
+
+    def run_client():
+        try:
+            assert ready.wait(5.0)
+            client(server)
+        except BaseException as exc:
+            client_error.append(exc)
+            server.shutdown()
+
+    client_thread = threading.Thread(target=run_client, name="runtime-server-test-client")
+    client_thread.start()
+    server.serve_forever(on_ready=ready.set)
+    client_thread.join(5.0)
+    assert not client_thread.is_alive()
+    if client_error:
+        raise client_error[0]
+
+
+def test_websocket_network_is_off_main_thread_and_protocol_behavior_is_preserved():
+    runtime = _FakeBridgeRuntime()
+    server = AgenticEnvironmentWebsocketServer(runtime, host="127.0.0.1", port=0)
+    packer = Packer()
+    main_thread_ident = threading.get_ident()
+    results = {}
+
+    def client(active_server):
+        port = active_server.bound_port
+        assert port is not None
+        connection = HTTPConnection("127.0.0.1", port, timeout=2.0)
+        connection.request("GET", "/healthz")
+        health = connection.getresponse()
+        results["health"] = (health.status, health.read())
+        connection.close()
+
+        uri = f"ws://127.0.0.1:{port}"
+        with connect(uri, compression=None, max_size=None) as controller:
+            results["metadata"] = unpackb(controller.recv())
+
+            with connect(uri, compression=None, max_size=None) as duplicate:
+                with pytest.raises(websockets.ConnectionClosed) as closed:
+                    duplicate.recv()
+                results["duplicate_close_code"] = closed.value.rcvd.code
+
+            controller.send(packer.pack({"operation": "step", "action": 1}))
+            results["step_1"] = unpackb(controller.recv())
+            controller.send(packer.pack({"operation": "unsupported"}))
+            results["typed_error"] = unpackb(controller.recv())
+            controller.send(packer.pack({"operation": "step", "action": 2}))
+            results["step_2"] = unpackb(controller.recv())
+
+        with connect(uri, compression=None, max_size=None) as replacement:
+            results["replacement_metadata"] = unpackb(replacement.recv())
+            replacement.send(packer.pack({"operation": "observe"}))
+            results["observe"] = unpackb(replacement.recv())
+
+        active_server.shutdown()
+
+    _serve_with_client(server, client)
+
+    assert results["health"] == (200, b"OK\n")
+    assert results["metadata"] == {
+        "service": "test_agentic_environment",
+        "protocol_version": 2,
+        "completed_steps": 0,
+    }
+    assert results["replacement_metadata"] == {
+        "service": "test_agentic_environment",
+        "protocol_version": 2,
+        "completed_steps": 2,
+    }
+    assert results["duplicate_close_code"] == 1013
+    assert results["step_1"] == {"ok": True, "result": {"action": 1}}
+    assert results["typed_error"] == {
+        "ok": False,
+        "error": {
+            "type": "ValueError",
+            "message": "Unsupported agentic environment operation: 'unsupported'.",
+        },
+    }
+    assert results["step_2"] == {"ok": True, "result": {"action": 2}}
+    assert results["observe"] == {"ok": True, "result": {"sequence": 3}}
+    assert runtime.steps == [1, 2]
+    assert runtime.metadata_threads == [main_thread_ident] * 5
+    assert runtime.dispatch_threads == [main_thread_ident, main_thread_ident, main_thread_ident]
+    assert server.network_thread_ident != main_thread_ident
+
+    port = server.bound_port
+    assert port is not None
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=0.2)
+
+
+def test_request_bridge_queue_full_duplicate_completion_and_shutdown_fail_closed():
+    packer = Packer()
+    bridge = RequestBridge(capacity=1)
+    first = bridge.submit(packer.pack({"operation": "step", "action": 1}))
+
+    with pytest.raises(RequestQueueFullError, match="queue is full"):
+        bridge.submit(packer.pack({"operation": "step", "action": 2}))
+
+    assert bridge.closed
+    assert isinstance(first.response.exception(), RequestQueueFullError)
+    assert bridge.get(0.0) is None
+
+    duplicate_bridge = RequestBridge(capacity=1)
+    envelope = duplicate_bridge.submit(packer.pack({"operation": "observe"}))
+    assert duplicate_bridge.get(0.0) is envelope
+    duplicate_bridge.complete(envelope, b"first")
+    with pytest.raises(DuplicateCompletionError, match="more than once"):
+        duplicate_bridge.complete(envelope, b"second")
+    assert duplicate_bridge.closed
+    assert isinstance(duplicate_bridge.close_reason, DuplicateCompletionError)
+
+    shutdown_bridge = RequestBridge(capacity=1)
+    pending = shutdown_bridge.submit(packer.pack({"operation": "step", "action": 3}))
+    shutdown_bridge.close(RequestBridgeShutdownError("test shutdown"))
+    assert isinstance(pending.response.exception(), RequestBridgeShutdownError)
+    assert shutdown_bridge.get(0.0) is None
+
+
+def test_request_timeout_fails_closed_without_replaying_mutation():
+    class SlowRuntime(_FakeBridgeRuntime):
+        def step(self, action):
+            self.dispatch_threads.append(threading.get_ident())
+            self.steps.append(action)
+            time.sleep(0.1)
+            return {"action": action}
+
+    runtime = SlowRuntime()
+    server = AgenticEnvironmentWebsocketServer(
+        runtime,
+        host="127.0.0.1",
+        port=0,
+        request_timeout=0.02,
+    )
+    ready = threading.Event()
+    response = []
+    client_error = []
+
+    def client():
+        try:
+            assert ready.wait(5.0)
+            with connect(f"ws://127.0.0.1:{server.bound_port}", compression=None, max_size=None) as websocket:
+                unpackb(websocket.recv())
+                websocket.send(Packer().pack({"operation": "step", "action": "mutate-once"}))
+                response.append(unpackb(websocket.recv()))
+        except BaseException as exc:
+            client_error.append(exc)
+
+    client_thread = threading.Thread(target=client, name="runtime-timeout-test-client")
+    client_thread.start()
+    with pytest.raises(NetworkThreadError, match="failed closed"):
+        server.serve_forever(on_ready=ready.set)
+    client_thread.join(5.0)
+
+    assert not client_thread.is_alive()
+    assert client_error == []
+    assert response == [
+        {
+            "ok": False,
+            "error": {
+                "type": "RequestTimeoutError",
+                "message": "Runtime request did not complete within 0.02 seconds.",
+            },
+        }
+    ]
+    assert runtime.steps == ["mutate-once"]
+
+
+def test_network_thread_startup_and_post_start_failure_are_fail_closed(monkeypatch):
+    startup_server = AgenticEnvironmentWebsocketServer(_FakeBridgeRuntime(), host="127.0.0.1", port=0)
+
+    async def fail_startup():
+        raise OSError("injected bind failure")
+
+    monkeypatch.setattr(startup_server._network, "_run", fail_startup)
+    with pytest.raises(NetworkStartupError, match="failed during startup"):
+        startup_server.serve_forever()
+    assert startup_server._bridge.closed
+    assert not startup_server._network.is_alive
+
+    death_server = AgenticEnvironmentWebsocketServer(_FakeBridgeRuntime(), host="127.0.0.1", port=0)
+
+    async def die_after_startup():
+        death_server._network._loop = asyncio.get_running_loop()
+        death_server._network._shutdown_event = asyncio.Event()
+        death_server._network.bound_port = 43210
+        death_server._network._ready.set()
+        await asyncio.sleep(0.02)
+        raise RuntimeError("injected network thread death")
+
+    monkeypatch.setattr(death_server._network, "_run", die_after_startup)
+    with pytest.raises(NetworkThreadError, match="failed closed"):
+        death_server.serve_forever()
+    assert death_server._bridge.closed
+    assert not death_server._network.is_alive
+
+
+def test_keyboard_interrupt_closes_network_thread_and_listener():
+    server = AgenticEnvironmentWebsocketServer(_FakeBridgeRuntime(), host="127.0.0.1", port=0)
+
+    def interrupt_after_bind():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        server.serve_forever(on_ready=interrupt_after_bind)
+
+    assert not server._network.is_alive
+    port = server.bound_port
+    assert port is not None
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=0.2)
