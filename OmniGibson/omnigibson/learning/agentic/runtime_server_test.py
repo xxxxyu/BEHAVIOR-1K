@@ -15,6 +15,7 @@ from websockets.sync.client import connect
 from omnigibson.learning.agentic.runtime_server import AgenticEnvironmentWebsocketServer
 from omnigibson.learning.agentic.runtime_server import AgenticEvaluatorRuntime
 from omnigibson.learning.agentic.runtime_server import DuplicateCompletionError
+from omnigibson.learning.agentic.runtime_server import JAW_CORRIDOR_CALIBRATION
 from omnigibson.learning.agentic.runtime_server import NetworkStartupError
 from omnigibson.learning.agentic.runtime_server import NetworkThreadError
 from omnigibson.learning.agentic.runtime_server import RequestBridge
@@ -22,6 +23,28 @@ from omnigibson.learning.agentic.runtime_server import RequestBridgeShutdownErro
 from omnigibson.learning.agentic.runtime_server import RequestQueueFullError
 from omnigibson.learning.utils.network_utils import Packer
 from omnigibson.learning.utils.network_utils import unpackb
+
+
+def test_jaw_corridor_calibration_declares_only_public_synchronized_sources():
+    assert JAW_CORRIDOR_CALIBRATION == {
+        "schema_version": 1,
+        "camera": "right_wrist",
+        "depth_unit": "meter",
+        "camera_model": "pinhole_linear_depth",
+        "gripper_frame": "right_eef",
+        "depth_uncertainty_floor_m": 0.001,
+        "source_fields": [
+            "right_wrist_depth_linear",
+            "right_wrist_camera_pose_robot",
+            "right_wrist_camera_intrinsics",
+            "right_eef_pose_robot",
+        ],
+    }
+    serialized = repr(JAW_CORRIDOR_CALIBRATION).lower()
+    assert not any(
+        forbidden in serialized
+        for forbidden in ("object_pose", "semantic", "contact", "grasp", "evaluator", "demonstration", "trace")
+    )
 
 
 class _FakeController:

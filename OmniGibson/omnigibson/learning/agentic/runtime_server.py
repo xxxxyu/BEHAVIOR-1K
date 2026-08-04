@@ -61,6 +61,20 @@ import websockets.asyncio.server as websocket_server
 logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 2
 CAMERA_POSE_KEY = "robot_r1::cam_rel_poses"
+JAW_CORRIDOR_CALIBRATION = {
+    "schema_version": 1,
+    "camera": "right_wrist",
+    "depth_unit": "meter",
+    "camera_model": "pinhole_linear_depth",
+    "gripper_frame": "right_eef",
+    "depth_uncertainty_floor_m": 0.001,
+    "source_fields": [
+        "right_wrist_depth_linear",
+        "right_wrist_camera_pose_robot",
+        "right_wrist_camera_intrinsics",
+        "right_eef_pose_robot",
+    ],
+}
 RADIO_PICKUP_PRECLOSE_ROLE = "radio_pickup_preclose_right"
 CHECKPOINT_ROLES = frozenset({"general", "demo_primary", "direct_press_fallback", RADIO_PICKUP_PRECLOSE_ROLE})
 REQUEST_QUEUE_CAPACITY = 1
@@ -256,6 +270,7 @@ class AgenticEvaluatorRuntime:
             metadata["depth_keys"] = {
                 camera: f"{name}::depth_linear" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()
             }
+            metadata["jaw_corridor_calibration"] = JAW_CORRIDOR_CALIBRATION
             metadata["available_modalities"].append("depth_linear")
         return metadata
 
