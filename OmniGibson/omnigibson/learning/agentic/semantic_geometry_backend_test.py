@@ -4,7 +4,10 @@ import pytest
 import torch as th
 
 from omnigibson.learning.agentic.semantic_geometry_backend import INTERPOLATION_MAX_JOINT_DELTA_RAD
+from omnigibson.learning.agentic.semantic_geometry_backend import DIAGNOSTIC_SOLVER_INPUT_QUANTUM
 from omnigibson.learning.agentic.semantic_geometry_backend import RadioSemanticGeometryBackend
+from omnigibson.learning.agentic.semantic_geometry_backend import _quantize_pose
+from omnigibson.learning.agentic.semantic_geometry_backend import _quantize_tensor
 from omnigibson.learning.agentic.semantic_geometry_backend import _resolve_curobo_device
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_ik_solution
@@ -105,6 +108,21 @@ def test_candidate_joint_state_is_copied_to_curobo_device_before_ik():
     th.testing.assert_close(backend.motion_generator.tensor_args.values[0], expected)
     th.testing.assert_close(result, expected + 10.0)
     th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
+
+
+def test_solver_inputs_quantize_restore_noise_without_losing_quaternion_normalization():
+    assert DIAGNOSTIC_SOLVER_INPUT_QUANTUM == 1e-4
+    left = th.tensor([1.234561, -0.500001])
+    right = th.tensor([1.234559, -0.499999])
+
+    th.testing.assert_close(_quantize_tensor(left), _quantize_tensor(right))
+    position, quaternion = _quantize_pose(
+        th.tensor([0.100001, -0.200001, 0.300001]),
+        th.tensor([0.100001, 0.200001, 0.300001, 0.900001]),
+    )
+
+    th.testing.assert_close(position, th.tensor([0.1, -0.2, 0.3]))
+    th.testing.assert_close(th.linalg.vector_norm(quaternion), th.tensor(1.0))
 
 
 def test_corridor_ik_seed_generator_reset_is_scoped_to_arm_solver():

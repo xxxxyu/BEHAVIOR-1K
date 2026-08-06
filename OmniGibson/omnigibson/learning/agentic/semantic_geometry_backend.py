@@ -37,6 +37,7 @@ RIGHT_ARM_CLEARANCE_LINKS = (
 )
 TABLE_CLEARANCE_MAX_DISTANCE_M = 1.0
 INTERPOLATION_MAX_JOINT_DELTA_RAD = 0.03
+DIAGNOSTIC_SOLVER_INPUT_QUANTUM = 1e-4
 
 
 def _resolve_curobo_device(device: str | None) -> str:
@@ -70,6 +71,19 @@ def _as_pose(value: Mapping[str, object], *, parent: str, child: str) -> tuple[t
 def _pose_digest(position: th.Tensor, quaternion: th.Tensor) -> str:
     payload = th.cat([position, quaternion]).detach().cpu().numpy().astype("<f4", copy=False).tobytes()
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _quantize_tensor(value: th.Tensor) -> th.Tensor:
+    return th.round(value / DIAGNOSTIC_SOLVER_INPUT_QUANTUM) * DIAGNOSTIC_SOLVER_INPUT_QUANTUM
+
+
+def _quantize_pose(position: th.Tensor, quaternion: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+    position = _quantize_tensor(position)
+    quaternion = _quantize_tensor(quaternion)
+    norm = th.linalg.vector_norm(quaternion)
+    if float(norm) <= 1e-8:
+        raise ValueError("Quantized pose has a zero quaternion.")
+    return position, quaternion / norm
 
 
 def _summarize_clearance(
@@ -140,6 +154,7 @@ class RadioSemanticGeometryBackend:
                 "source_api": "CuRoboMotionGenerator.compute_trajectories(ARM,initial_joint_pos,ik_only=True)",
                 "model": "R1Pro arm embodiment with base and grippers locked to hypothetical joint state",
                 "seed_strategy": "reset CuRobo ARM IKSolver Halton generator before each corridor evaluation",
+                "input_quantum": DIAGNOSTIC_SOLVER_INPUT_QUANTUM,
             },
             "arm_trajectory_collision": {
                 "status": "available",
@@ -178,7 +193,8 @@ class RadioSemanticGeometryBackend:
         return joint_state
 
     def _candidate_joint_state_for_curobo(self, candidate_base_pose: Mapping[str, object]) -> th.Tensor:
-        return self.motion_generator.tensor_args.to_device(self._candidate_joint_state(candidate_base_pose))
+        candidate = self.motion_generator.tensor_args.to_device(self._candidate_joint_state(candidate_base_pose))
+        return _quantize_tensor(candidate)
 
     def _reset_ik_seed_generator(self) -> None:
         """Make a read-only corridor query independent of prior diagnostic queries."""
@@ -247,7 +263,7 @@ class RadioSemanticGeometryBackend:
             self._table_mesh_digest = digest
 
     def _target_pose(self, value: Mapping[str, object], stage: str) -> tuple[th.Tensor, th.Tensor]:
-        return _as_pose(value, parent="simulator_world", child=f"right_eef_{stage}")
+        return _quantize_pose(*_as_pose(value, parent="simulator_world", child=f"right_eef_{stage}"))
 
     def _left_hold_pose(self, candidate_base_pose: Mapping[str, object]) -> tuple[th.Tensor, th.Tensor]:
         """Carry the current base-relative left EEF pose to the hypothetical base."""
@@ -263,7 +279,7 @@ class RadioSemanticGeometryBackend:
         candidate_orientation = candidate_orientation.to(device=current_base_orientation.device)
         base_inverse = T.invert_pose_transform(current_base_position, current_base_orientation)
         base_to_left = T.pose_transform(*base_inverse, current_left_position, current_left_orientation)
-        return T.pose_transform(candidate_position, candidate_orientation, *base_to_left)
+        return _quantize_pose(*T.pose_transform(candidate_position, candidate_orientation, *base_to_left))
 
     def _interpolated(self, start: th.Tensor, goal: th.Tensor) -> th.Tensor:
         intervals = max(1, math.ceil(float(th.max(th.abs(goal - start))) / INTERPOLATION_MAX_JOINT_DELTA_RAD))
