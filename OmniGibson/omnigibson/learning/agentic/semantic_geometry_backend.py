@@ -166,6 +166,9 @@ class RadioSemanticGeometryBackend:
         joint_state[self.robot.base_idx] = th.cat([relative_position, intrinsic_eulers])
         return joint_state
 
+    def _candidate_joint_state_for_curobo(self, candidate_base_pose: Mapping[str, object]) -> th.Tensor:
+        return self.motion_generator.tensor_args.to_device(self._candidate_joint_state(candidate_base_pose))
+
     def _table_world(self):
         robot_transform = T.pose_inv(T.pose2mat(self.robot.root_link.get_position_orientation()))
         scope = getattr(getattr(self.env, "task", None), "object_scope", None)
@@ -327,7 +330,7 @@ class RadioSemanticGeometryBackend:
     ) -> dict[str, object]:
         if tuple(target_poses) != CORRIDOR_STAGE_NAMES:
             raise ValueError(f"Target poses must contain {CORRIDOR_STAGE_NAMES} in order.")
-        candidate_q = self._candidate_joint_state(candidate_base_pose)
+        candidate_q = self._candidate_joint_state_for_curobo(candidate_base_pose)
         self.motion_generator.update_obstacles()
         current_left_position, current_left_orientation = self._left_hold_pose(candidate_base_pose)
         start_q = candidate_q

@@ -81,6 +81,31 @@ def test_candidate_joint_state_encodes_world_pose_relative_to_immutable_root():
     th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
 
 
+def test_candidate_joint_state_is_copied_to_curobo_device_before_ik():
+    class _TensorArgs:
+        def __init__(self):
+            self.values = []
+
+        def to_device(self, value):
+            self.values.append(value.clone())
+            return value + 10.0
+
+    class _MotionGenerator:
+        def __init__(self):
+            self.tensor_args = _TensorArgs()
+
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.robot = _Robot()
+    backend.motion_generator = _MotionGenerator()
+
+    result = backend._candidate_joint_state_for_curobo(_pose([13.0, 25.0, 0.0]))
+
+    expected = th.tensor([3.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    th.testing.assert_close(backend.motion_generator.tensor_args.values[0], expected)
+    th.testing.assert_close(result, expected + 10.0)
+    th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
+
+
 def test_left_hold_pose_is_carried_with_hypothetical_base_instead_of_world_fixed():
     backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
     backend.robot = _Robot()
