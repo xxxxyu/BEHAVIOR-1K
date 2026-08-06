@@ -99,6 +99,37 @@ def test_joint_interpolation_respects_declared_maximum_increment():
     assert float(th.max(th.abs(th.diff(trajectory, dim=0)))) <= INTERPOLATION_MAX_JOINT_DELTA_RAD
 
 
+def test_ik_goal_uses_existing_full_joint_state_without_reaugmenting_locked_joints():
+    class _MotionGenerator:
+        def __init__(self):
+            self.calls = []
+
+        def path_to_joint_trajectory(self, joint_state, *, get_full_js, emb_sel):
+            self.calls.append((joint_state, get_full_js, emb_sel))
+            return th.arange(8, dtype=th.float32)
+
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.motion_generator = _MotionGenerator()
+    joint_state = object()
+
+    result = backend._ik_goal_joint_positions(joint_state, expected_shape=th.Size([8]))
+
+    th.testing.assert_close(result, th.arange(8, dtype=th.float32))
+    assert backend.motion_generator.calls == [(joint_state, False, "arm")]
+
+
+def test_ik_goal_rejects_incomplete_joint_state():
+    class _MotionGenerator:
+        def path_to_joint_trajectory(self, *args, **kwargs):
+            return th.zeros(7)
+
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.motion_generator = _MotionGenerator()
+
+    with pytest.raises(RuntimeError, match="expected \\(8,\\)"):
+        backend._ik_goal_joint_positions(object(), expected_shape=th.Size([8]))
+
+
 def test_clearance_summary_uses_the_minimum_sample_for_saturation_semantics():
     spheres = th.tensor([[[[0.0, 0.0, 0.0, 0.05], [0.0, 0.0, 0.0, 0.02]]]])
     result = _summarize_clearance(

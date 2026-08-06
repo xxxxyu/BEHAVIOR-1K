@@ -251,6 +251,20 @@ class RadioSemanticGeometryBackend:
         fractions = th.linspace(0.0, 1.0, intervals + 1, device=start.device)
         return start.unsqueeze(0) + fractions.unsqueeze(1) * (goal - start).unsqueeze(0)
 
+    def _ik_goal_joint_positions(self, joint_state: object, *, expected_shape: th.Size) -> th.Tensor:
+        positions = self.motion_generator.path_to_joint_trajectory(
+            joint_state,
+            get_full_js=False,
+            emb_sel=CuRoboEmbodimentSelection.ARM,
+        )
+        if positions.ndim == 2 and positions.shape[0] == 1:
+            positions = positions[0]
+        if positions.ndim != 1 or positions.shape != expected_shape:
+            raise RuntimeError(
+                f"IK-only ARM result has shape {tuple(positions.shape)}, expected {tuple(expected_shape)}."
+            )
+        return positions
+
     def _right_arm_sphere_indices(self) -> th.Tensor:
         config = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM].kinematics.kinematics_config
         indices = []
@@ -351,9 +365,7 @@ class RadioSemanticGeometryBackend:
                     "clearance": {"status": "not_evaluated", "reason": "ik_failed"},
                 }
                 break
-            goal_q = self.motion_generator.path_to_joint_trajectory(
-                joint_states[0], get_full_js=True, emb_sel=CuRoboEmbodimentSelection.ARM
-            )[-1]
+            goal_q = self._ik_goal_joint_positions(joint_states[0], expected_shape=start_q.shape)
             trajectory = self._interpolated(start_q, goal_q)
             collision = self.motion_generator.check_collisions(
                 trajectory,
