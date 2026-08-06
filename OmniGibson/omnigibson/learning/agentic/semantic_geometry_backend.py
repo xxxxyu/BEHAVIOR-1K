@@ -18,6 +18,7 @@ import omnigibson.utils.transform_utils as T
 from omnigibson.action_primitives.curobo import CuRoboEmbodimentSelection
 from omnigibson.action_primitives.curobo import CuRoboMotionGenerator
 from omnigibson.action_primitives.curobo import create_world_mesh_collision
+from omnigibson.macros import gm
 
 
 CORRIDOR_STAGE_NAMES = ("pregrasp", "preclose", "lift_1", "lift_2")
@@ -36,6 +37,19 @@ RIGHT_ARM_CLEARANCE_LINKS = (
 )
 TABLE_CLEARANCE_MAX_DISTANCE_M = 1.0
 INTERPOLATION_MAX_JOINT_DELTA_RAD = 0.03
+
+
+def _resolve_curobo_device(device: str | None) -> str:
+    """Resolve CuRobo's CUDA device independently of the physics tensor backend."""
+
+    if device is None:
+        if gm.GPU_ID is None:
+            raise RuntimeError("CuRobo diagnostics require an explicit OMNIGIBSON_GPU_ID.")
+        device = f"cuda:{int(gm.GPU_ID)}"
+    resolved = th.device(device)
+    if resolved.type != "cuda" or resolved.index is None:
+        raise ValueError(f"CuRobo diagnostics require an indexed CUDA device, got {device!r}.")
+    return str(resolved)
 
 
 def _as_pose(value: Mapping[str, object], *, parent: str, child: str) -> tuple[th.Tensor, th.Tensor]:
@@ -92,7 +106,7 @@ class RadioSemanticGeometryBackend:
             raise RuntimeError("Radio geometry backend requires exactly one simulator scene.")
         self.env = env
         self.robot = robot
-        self.device = str(device or og.sim.device)
+        self.device = _resolve_curobo_device(device)
         self.motion_generator = CuRoboMotionGenerator(
             robot,
             robot_cfg_path={

@@ -174,7 +174,6 @@ class AgenticEvaluatorRuntime:
                 self._semantic_geometry_backend = RadioSemanticGeometryBackend(
                     self.evaluator.env,
                     self.robot,
-                    device=og.sim.device,
                 )
             except Exception as exc:
                 # Keep the diagnostic runtime usable and report the missing capability

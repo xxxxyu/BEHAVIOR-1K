@@ -5,7 +5,9 @@ import torch as th
 
 from omnigibson.learning.agentic.semantic_geometry_backend import INTERPOLATION_MAX_JOINT_DELTA_RAD
 from omnigibson.learning.agentic.semantic_geometry_backend import RadioSemanticGeometryBackend
+from omnigibson.learning.agentic.semantic_geometry_backend import _resolve_curobo_device
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
+from omnigibson.macros import gm
 
 
 class _PoseLink:
@@ -39,6 +41,34 @@ def _pose(position):
         "translation_m": position,
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
+
+
+def test_curobo_device_uses_explicit_omnigibson_gpu():
+    previous = gm.GPU_ID
+    try:
+        with gm.unlocked():
+            gm.GPU_ID = "3"
+        assert _resolve_curobo_device(None) == "cuda:3"
+    finally:
+        with gm.unlocked():
+            gm.GPU_ID = previous
+
+
+def test_curobo_device_rejects_physics_cpu_device():
+    with pytest.raises(ValueError, match="indexed CUDA device"):
+        _resolve_curobo_device("cpu")
+
+
+def test_curobo_device_requires_explicit_gpu_selection():
+    previous = gm.GPU_ID
+    try:
+        with gm.unlocked():
+            gm.GPU_ID = None
+        with pytest.raises(RuntimeError, match="OMNIGIBSON_GPU_ID"):
+            _resolve_curobo_device(None)
+    finally:
+        with gm.unlocked():
+            gm.GPU_ID = previous
 
 
 def test_candidate_joint_state_encodes_world_pose_relative_to_immutable_root():
