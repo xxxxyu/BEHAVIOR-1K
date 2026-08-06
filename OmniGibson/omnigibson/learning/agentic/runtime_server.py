@@ -34,6 +34,8 @@ from omnigibson.learning.agentic.kinematics import bounded_pose_delta_ik_step
 from omnigibson.learning.agentic.kinematics import bounded_position_ik_step
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_demo_primary_checkpoint
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_pickup_preclose_checkpoint
+from omnigibson.learning.agentic.semantic_geometry import capture_navigation_geometry
+from omnigibson.learning.agentic.semantic_geometry import navigation_geometry_deltas
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
@@ -126,6 +128,7 @@ class AgenticEvaluatorRuntime:
         snapshot_dir: Path | None = None,
         snapshot_import_dirs: tuple[Path, ...] = (),
         radio_pickup_fixture_reference_snapshot_id: str | None = None,
+        enable_semantic_geometry_diagnostic: bool = False,
     ) -> None:
         if information_arm not in {"vision_rgb", "vision_rgb_depth"}:
             raise ValueError(f"Unsupported agentic information arm: {information_arm!r}.")
@@ -139,6 +142,9 @@ class AgenticEvaluatorRuntime:
             snapshot_dir.parent / "restore_diagnostics.jsonl" if snapshot_dir is not None else None
         )
         self.snapshot_import_dirs = snapshot_import_dirs
+        self.enable_semantic_geometry_diagnostic = enable_semantic_geometry_diagnostic
+        if enable_semantic_geometry_diagnostic and self.task_name != "turning_on_radio":
+            raise ValueError("Semantic geometry diagnostics are available only for turning_on_radio.")
         self.evaluator = Evaluator(config)
         self.evaluator.reset()
         self.evaluator.load_task_instance(self.instance_id)
@@ -156,6 +162,8 @@ class AgenticEvaluatorRuntime:
         self._metrics_finished = False
         self._last_metrics: dict[str, object] | None = None
         self.attempt_index = 0
+        self._navigation_geometry_baseline: dict[str, object] | None = None
+        self._navigation_geometry_baseline_snapshot_id: str | None = None
 
         self.robot = self.evaluator.robot
         self.controller_manifest = build_controller_manifest(self.robot, simulator=og.sim)
@@ -266,6 +274,12 @@ class AgenticEvaluatorRuntime:
                 else None
             ),
         }
+        if self.enable_semantic_geometry_diagnostic:
+            metadata["semantic_geometry_diagnostic"] = {
+                "profile": "radio_generation_015_semantic_geometry",
+                "privileged": True,
+                "read_only_query": "inspect_navigation_geometry",
+            }
         if self.information_arm == "vision_rgb_depth":
             metadata["depth_keys"] = {
                 camera: f"{name}::depth_linear" for camera, name in ROBOT_CAMERA_NAMES["R1Pro"].items()
@@ -385,6 +399,58 @@ class AgenticEvaluatorRuntime:
             "attempt_index": self.attempt_index,
         }
 
+    def inspect_navigation_geometry(self) -> dict[str, object]:
+        """Return observation-bound privileged geometry without changing runtime state."""
+
+        if not self.enable_semantic_geometry_diagnostic:
+            raise PermissionError("Semantic navigation geometry is disabled outside the Generation-015 diagnostic.")
+        if self.task_name != "turning_on_radio":
+            raise RuntimeError("Semantic navigation geometry is available only for turning_on_radio.")
+        if self._navigation_geometry_baseline is None or self._navigation_geometry_baseline_snapshot_id is None:
+            raise RuntimeError("Semantic navigation geometry requires an explicit immutable fixture restore first.")
+        observation_id = self._observation_id(torch_to_numpy(self.evaluator.obs))
+        env_step = int(self.evaluator.env._current_step)
+        runtime_state = _jsonable(
+            {
+                "last_reward": self.last_reward,
+                "last_info": self.last_info,
+                "terminated": self.terminated,
+                "truncated": self.truncated,
+                "finished": self.finished,
+                "metrics_finished": self._metrics_finished,
+                "last_metrics": self._last_metrics,
+            }
+        )
+        current = capture_navigation_geometry(self.evaluator.env, self.robot)
+        if int(self.evaluator.env._current_step) != env_step:
+            raise RuntimeError("Read-only semantic geometry query unexpectedly advanced the environment.")
+        if runtime_state != _jsonable(
+            {
+                "last_reward": self.last_reward,
+                "last_info": self.last_info,
+                "terminated": self.terminated,
+                "truncated": self.truncated,
+                "finished": self.finished,
+                "metrics_finished": self._metrics_finished,
+                "last_metrics": self._last_metrics,
+            }
+        ):
+            raise RuntimeError("Read-only semantic geometry query unexpectedly changed evaluator state.")
+        return {
+            "schema_version": 1,
+            "diagnostic_profile": "radio_generation_015_semantic_geometry",
+            "privileged": True,
+            "read_only": True,
+            "observation_id": observation_id,
+            "env_step": env_step,
+            "baseline_snapshot_id": self._navigation_geometry_baseline_snapshot_id,
+            "geometry": current,
+            "immutable_baseline_deltas": navigation_geometry_deltas(
+                self._navigation_geometry_baseline,
+                current,
+            ),
+        }
+
     def step(self, action: object) -> dict[str, object]:
         if self.finished:
             raise RuntimeError("Cannot step a finalized agentic environment.")
@@ -458,6 +524,7 @@ class AgenticEvaluatorRuntime:
             report = self.session.restore(snapshot)
         finally:
             self.session.resume()
+        self._capture_navigation_geometry_baseline(snapshot_id)
         return {"snapshot_id": snapshot_id, "restore_report": report.to_dict(), **self.observe()}
 
     def finish(self) -> dict[str, object]:
@@ -494,6 +561,7 @@ class AgenticEvaluatorRuntime:
             report = self.session.restore(snapshot)
         finally:
             self.session.resume()
+        self._capture_navigation_geometry_baseline(snapshot.snapshot_id)
         self.attempt_index += 1
         self.evaluator.obs = self.evaluator._preprocess_obs(self.evaluator.env.get_obs()[0])
         return {
@@ -508,6 +576,12 @@ class AgenticEvaluatorRuntime:
     def close(self) -> None:
         self.session.close()
         self.evaluator.env.close()
+
+    def _capture_navigation_geometry_baseline(self, snapshot_id: str) -> None:
+        if not self.enable_semantic_geometry_diagnostic or self.task_name != "turning_on_radio":
+            return
+        self._navigation_geometry_baseline = capture_navigation_geometry(self.evaluator.env, self.robot)
+        self._navigation_geometry_baseline_snapshot_id = snapshot_id
 
     def _load_imported_snapshots(self) -> int:
         imported = 0
@@ -1133,6 +1207,8 @@ class AgenticEnvironmentWebsocketServer:
         operation = request.get("operation")
         if operation == "observe":
             return self.runtime.observe()
+        if operation == "inspect_navigation_geometry":
+            return self.runtime.inspect_navigation_geometry()
         if operation == "step":
             return self.runtime.step(request.get("action"))
         if operation == "snapshot":
@@ -1229,6 +1305,7 @@ def main() -> None:
     parser.add_argument("--snapshot-dir", type=Path)
     parser.add_argument("--import-snapshot-dir", type=Path, action="append", default=[])
     parser.add_argument("--radio-pickup-fixture-reference-snapshot-id")
+    parser.add_argument("--enable-semantic-geometry-diagnostic", action="store_true")
     parser.add_argument("--enable-restore-failure-injection", action="store_true")
     args = parser.parse_args()
     args.log_path.mkdir(parents=True, exist_ok=False)
@@ -1249,6 +1326,7 @@ def main() -> None:
             snapshot_dir=args.snapshot_dir or args.log_path.parent / "snapshots",
             snapshot_import_dirs=tuple(args.import_snapshot_dir),
             radio_pickup_fixture_reference_snapshot_id=args.radio_pickup_fixture_reference_snapshot_id,
+            enable_semantic_geometry_diagnostic=args.enable_semantic_geometry_diagnostic,
         )
         server = AgenticEnvironmentWebsocketServer(
             runtime,

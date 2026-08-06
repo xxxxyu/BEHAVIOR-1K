@@ -173,6 +173,25 @@ def test_plan_eef_pose_delta_websocket_dispatch_calls_planner_without_action():
     ]
 
 
+def test_semantic_navigation_geometry_websocket_dispatch_is_explicit_and_read_only():
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def inspect_navigation_geometry(self):
+            self.calls += 1
+            return {"observation_id": "obs-256", "env_step": 256, "read_only": True}
+
+    runtime = FakeRuntime()
+    server = AgenticEnvironmentWebsocketServer.__new__(AgenticEnvironmentWebsocketServer)
+    server.runtime = runtime
+
+    result = server._dispatch({"operation": "inspect_navigation_geometry"})
+
+    assert result == {"observation_id": "obs-256", "env_step": 256, "read_only": True}
+    assert runtime.calls == 1
+
+
 class _FakeBridgeRuntime:
     def __init__(self) -> None:
         self.metadata_threads: list[int] = []
