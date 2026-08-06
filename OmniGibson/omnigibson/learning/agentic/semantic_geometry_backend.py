@@ -75,6 +75,23 @@ def _pose_digest(position: th.Tensor, quaternion: th.Tensor) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def _pose_residual(
+    actual_position: th.Tensor,
+    actual_orientation: th.Tensor,
+    target_position: th.Tensor,
+    target_orientation: th.Tensor,
+) -> dict[str, float]:
+    target_position = target_position.to(device=actual_position.device, dtype=actual_position.dtype)
+    target_orientation = target_orientation.to(device=actual_orientation.device, dtype=actual_orientation.dtype)
+    actual_orientation = actual_orientation / th.linalg.vector_norm(actual_orientation)
+    target_orientation = target_orientation / th.linalg.vector_norm(target_orientation)
+    dot = th.clamp(th.abs(th.dot(actual_orientation, target_orientation)), 0.0, 1.0)
+    return {
+        "translation_m": float(th.linalg.vector_norm(actual_position - target_position).detach().cpu()),
+        "orientation_rad": float((2.0 * th.acos(dot)).detach().cpu()),
+    }
+
+
 def _quantize_tensor(value: th.Tensor) -> th.Tensor:
     return th.round(value / DIAGNOSTIC_SOLVER_INPUT_QUANTUM) * DIAGNOSTIC_SOLVER_INPUT_QUANTUM
 
@@ -526,14 +543,7 @@ class RadioSemanticGeometryBackend:
         link_pose = arm_mg.compute_kinematics(joint_state).link_poses[self.robot.eef_link_names["right"]]
         actual_position = link_pose.position.reshape(-1, 3)[-1]
         actual_orientation = link_pose.quaternion.reshape(-1, 4)[-1][[1, 2, 3, 0]]
-        actual_orientation = actual_orientation / th.linalg.vector_norm(actual_orientation)
-        target_orientation = target_orientation.to(device=actual_orientation.device)
-        target_orientation = target_orientation / th.linalg.vector_norm(target_orientation)
-        dot = th.clamp(th.abs(th.dot(actual_orientation, target_orientation)), 0.0, 1.0)
-        return {
-            "translation_m": float(th.linalg.vector_norm(actual_position - target_position).detach().cpu()),
-            "orientation_rad": float((2.0 * th.acos(dot)).detach().cpu()),
-        }
+        return _pose_residual(actual_position, actual_orientation, target_position, target_orientation)
 
     def _provenance_branch(
         self,
