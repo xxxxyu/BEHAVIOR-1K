@@ -4,6 +4,7 @@ import copy
 
 import numpy as np
 import pytest
+import torch as th
 
 from omnigibson.learning.agentic.runtime_server import AgenticEvaluatorRuntime
 from omnigibson.learning.agentic.semantic_geometry import RADIO_TASK_BINDING
@@ -48,6 +49,7 @@ class _Object:
         self.position = np.asarray(position, dtype=np.float64)
         self.quaternion = np.asarray(quaternion, dtype=np.float64)
         self.extent = np.asarray(extent, dtype=np.float64)
+        self.joint_positions = th.zeros(8, dtype=th.float32)
         self.links = {"base": _Link(f"{prim_path}/base")}
         self.states = {
             ContactBodies: _State(set(contacts)),
@@ -61,6 +63,9 @@ class _Object:
         assert visual is False
         assert xy_aligned is True
         return self.position.copy(), self.quaternion.copy(), self.extent.copy(), np.zeros(3)
+
+    def get_joint_positions(self):
+        return self.joint_positions.clone()
 
 
 class _Binding:
@@ -146,6 +151,25 @@ def test_semantic_identity_uses_exact_task_bindings_and_collision_footprints():
     }
 
 
+def test_semantic_geometry_capability_override_is_reported_without_changing_default_contract():
+    env, robot, _radio, _table = _fixture()
+    available = {
+        name: {"status": "available", "source_api": f"test:{name}"}
+        for name in (
+            "hypothetical_base_pose_whole_arm_ik",
+            "arm_trajectory_collision",
+            "arm_table_clearance",
+        )
+    }
+
+    default = capture_navigation_geometry(env, robot)
+    overridden = capture_navigation_geometry(env, robot, backend_capabilities=available)
+
+    assert default["capabilities"]["hypothetical_base_pose_whole_arm_ik"]["status"] == "unavailable"
+    assert all(overridden["capabilities"][name] == value for name, value in available.items())
+    assert "are available in diagnostic mode" in overridden["navigation_model"]["limitations"][-1]
+
+
 def test_geometry_deltas_are_quaternion_sign_invariant_and_frame_labelled():
     env, robot, radio, _table = _fixture()
     baseline = capture_navigation_geometry(env, robot)
@@ -217,3 +241,90 @@ def test_runtime_query_is_permission_gated_outside_generation_015():
 
     with pytest.raises(PermissionError, match="disabled outside"):
         runtime.inspect_navigation_geometry()
+
+
+class _FakeSemanticBackend:
+    def __init__(self, robot, *, mutate_joint_state=False):
+        self.robot = robot
+        self.mutate_joint_state = mutate_joint_state
+        self.requests = []
+
+    def capabilities(self):
+        return {
+            name: {"status": "available"}
+            for name in (
+                "hypothetical_base_pose_whole_arm_ik",
+                "arm_trajectory_collision",
+                "arm_table_clearance",
+            )
+        }
+
+    def evaluate_corridor(self, **request):
+        self.requests.append(copy.deepcopy(request))
+        if self.mutate_joint_state:
+            self.robot.joint_positions[0] += 1.0
+        return {"schema_version": 1, "status": "available", "stages": {}}
+
+
+def _runtime_with_semantic_backend(*, mutate_joint_state=False):
+    env, robot, _radio, _table = _fixture()
+    runtime = AgenticEvaluatorRuntime.__new__(AgenticEvaluatorRuntime)
+    runtime.task_name = "turning_on_radio"
+    runtime.enable_semantic_geometry_diagnostic = True
+    runtime.robot = robot
+    runtime.evaluator = type("Evaluator", (), {"env": env, "obs": {"public": np.asarray([1.0])}})()
+    runtime._observation_id = lambda _observation: "obs-256-test"
+    runtime._semantic_geometry_backend = _FakeSemanticBackend(
+        robot,
+        mutate_joint_state=mutate_joint_state,
+    )
+    runtime._semantic_geometry_backend_error = None
+    return runtime, env, robot
+
+
+def test_semantic_corridor_runtime_rejects_stale_observation_before_backend_call():
+    runtime, _env, _robot = _runtime_with_semantic_backend()
+
+    with pytest.raises(RuntimeError, match="not bound to the current observation"):
+        runtime.evaluate_semantic_pickup_corridor(
+            observation_id="stale-observation",
+            env_step=255,
+            candidate_base_pose={"candidate": True},
+            target_poses={"targets": True},
+        )
+
+    assert runtime._semantic_geometry_backend.requests == []
+
+
+def test_semantic_corridor_runtime_is_observation_bound_and_preserves_simulator_state():
+    runtime, env, robot = _runtime_with_semantic_backend()
+    before_q = robot.get_joint_positions()
+    candidate = {"candidate": True}
+    targets = {"targets": True}
+
+    result = runtime.evaluate_semantic_pickup_corridor(
+        observation_id="obs-256-test",
+        env_step=256,
+        candidate_base_pose=candidate,
+        target_poses=targets,
+    )
+
+    assert result["observation_id"] == "obs-256-test"
+    assert result["env_step"] == 256
+    assert result["read_only"] is True
+    assert result["privileged"] is True
+    assert runtime._semantic_geometry_backend.requests == [{"candidate_base_pose": candidate, "target_poses": targets}]
+    assert env._current_step == 256
+    assert th.equal(robot.get_joint_positions(), before_q)
+
+
+def test_semantic_corridor_runtime_detects_backend_joint_state_mutation():
+    runtime, _env, _robot = _runtime_with_semantic_backend(mutate_joint_state=True)
+
+    with pytest.raises(RuntimeError, match="changed simulator joint positions"):
+        runtime.evaluate_semantic_pickup_corridor(
+            observation_id="obs-256-test",
+            env_step=256,
+            candidate_base_pose={"candidate": True},
+            target_poses={"targets": True},
+        )

@@ -36,6 +36,7 @@ from omnigibson.learning.agentic.retry_checkpoint import assess_radio_demo_prima
 from omnigibson.learning.agentic.retry_checkpoint import assess_radio_pickup_preclose_checkpoint
 from omnigibson.learning.agentic.semantic_geometry import capture_navigation_geometry
 from omnigibson.learning.agentic.semantic_geometry import navigation_geometry_deltas
+from omnigibson.learning.agentic.semantic_geometry_backend import RadioSemanticGeometryBackend
 from omnigibson.learning.agentic.snapshot import CompositeSnapshot
 from omnigibson.learning.agentic.snapshot import CompositeSnapshotManager
 from omnigibson.learning.agentic.snapshot import AttributeSnapshotComponent
@@ -166,6 +167,22 @@ class AgenticEvaluatorRuntime:
         self._navigation_geometry_baseline_snapshot_id: str | None = None
 
         self.robot = self.evaluator.robot
+        self._semantic_geometry_backend: RadioSemanticGeometryBackend | None = None
+        self._semantic_geometry_backend_error: str | None = None
+        if self.enable_semantic_geometry_diagnostic:
+            try:
+                self._semantic_geometry_backend = RadioSemanticGeometryBackend(
+                    self.evaluator.env,
+                    self.robot,
+                    device=og.sim.device,
+                )
+            except Exception as exc:
+                # Keep the diagnostic runtime usable and report the missing capability
+                # explicitly.  Route acceptance remains fail-closed until this succeeds.
+                self._semantic_geometry_backend_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Could not initialize the semantic-geometry backend: %s", self._semantic_geometry_backend_error
+                )
         self.controller_manifest = build_controller_manifest(self.robot, simulator=og.sim)
         validate_r1pro_manifest(self.controller_manifest)
         progress_fn = CHALLENGE_TASKS_PROGRESS_APPROXIMATION[self.task_name]
@@ -421,7 +438,23 @@ class AgenticEvaluatorRuntime:
                 "last_metrics": self._last_metrics,
             }
         )
-        current = capture_navigation_geometry(self.evaluator.env, self.robot)
+        backend = getattr(self, "_semantic_geometry_backend", None)
+        backend_error = getattr(self, "_semantic_geometry_backend_error", None)
+        backend_capabilities = backend.capabilities() if backend is not None else None
+        if backend_capabilities is None and backend_error is not None:
+            backend_capabilities = {
+                name: {"status": "unavailable", "reason": backend_error}
+                for name in (
+                    "hypothetical_base_pose_whole_arm_ik",
+                    "arm_trajectory_collision",
+                    "arm_table_clearance",
+                )
+            }
+        current = capture_navigation_geometry(
+            self.evaluator.env,
+            self.robot,
+            backend_capabilities=backend_capabilities,
+        )
         if int(self.evaluator.env._current_step) != env_step:
             raise RuntimeError("Read-only semantic geometry query unexpectedly advanced the environment.")
         if runtime_state != _jsonable(
@@ -450,6 +483,72 @@ class AgenticEvaluatorRuntime:
                 current,
             ),
         }
+
+    def evaluate_semantic_pickup_corridor(
+        self,
+        *,
+        observation_id: str,
+        env_step: int,
+        candidate_base_pose: Mapping[str, object],
+        target_poses: Mapping[str, Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Run privileged CuRobo corridor queries without changing simulator state."""
+
+        if not self.enable_semantic_geometry_diagnostic:
+            raise PermissionError("Semantic navigation geometry is disabled outside the Generation-015 diagnostic.")
+        if self._semantic_geometry_backend is None:
+            raise RuntimeError(
+                "Semantic geometry backend is unavailable: "
+                f"{self._semantic_geometry_backend_error or 'not initialized'}."
+            )
+        current_observation_id = self._observation_id(torch_to_numpy(self.evaluator.obs))
+        current_env_step = int(self.evaluator.env._current_step)
+        if observation_id != current_observation_id or int(env_step) != current_env_step:
+            raise RuntimeError("Semantic corridor query is not bound to the current observation and environment step.")
+        before_q = self.robot.get_joint_positions().detach().clone()
+        before_geometry = capture_navigation_geometry(
+            self.evaluator.env,
+            self.robot,
+            backend_capabilities=self._semantic_geometry_backend.capabilities(),
+        )
+        result = self._semantic_geometry_backend.evaluate_corridor(
+            candidate_base_pose=candidate_base_pose,
+            target_poses=target_poses,
+        )
+        after_q = self.robot.get_joint_positions().detach().clone()
+        after_geometry = capture_navigation_geometry(
+            self.evaluator.env,
+            self.robot,
+            backend_capabilities=self._semantic_geometry_backend.capabilities(),
+        )
+        if current_env_step != int(self.evaluator.env._current_step):
+            raise RuntimeError("Semantic corridor query unexpectedly advanced the environment.")
+        if not th.equal(before_q, after_q):
+            raise RuntimeError("Semantic corridor query unexpectedly changed simulator joint positions.")
+        deltas = navigation_geometry_deltas(before_geometry, after_geometry)
+        if (
+            any(
+                deltas[name][metric] != 0.0
+                for name in ("robot", "radio", "support_table")
+                for metric in ("translation_norm_m", "orientation_angle_rad")
+            )
+            or deltas["radio_support_changed"]
+            or deltas["contact_pairs_changed"]
+        ):
+            raise RuntimeError("Semantic corridor query unexpectedly changed simulator geometry or contacts.")
+        result.update(
+            {
+                "privileged": True,
+                "read_only": True,
+                "observation_id": current_observation_id,
+                "env_step": current_env_step,
+                "candidate_base_pose": _jsonable(candidate_base_pose),
+                "target_pose_digest": hashlib.sha256(
+                    json.dumps(_jsonable(target_poses), sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        return result
 
     def step(self, action: object) -> dict[str, object]:
         if self.finished:
@@ -1209,6 +1308,17 @@ class AgenticEnvironmentWebsocketServer:
             return self.runtime.observe()
         if operation == "inspect_navigation_geometry":
             return self.runtime.inspect_navigation_geometry()
+        if operation == "evaluate_semantic_pickup_corridor":
+            candidate_base_pose = request.get("candidate_base_pose")
+            target_poses = request.get("target_poses")
+            if not isinstance(candidate_base_pose, Mapping) or not isinstance(target_poses, Mapping):
+                raise ValueError("Semantic corridor query requires candidate_base_pose and target_poses objects.")
+            return self.runtime.evaluate_semantic_pickup_corridor(
+                observation_id=str(request.get("observation_id") or ""),
+                env_step=int(request.get("env_step", -1)),
+                candidate_base_pose=candidate_base_pose,
+                target_poses=target_poses,
+            )
         if operation == "step":
             return self.runtime.step(request.get("action"))
         if operation == "snapshot":

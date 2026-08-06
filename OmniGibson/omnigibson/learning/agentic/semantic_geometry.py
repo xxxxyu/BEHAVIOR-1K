@@ -109,9 +109,7 @@ def _collision_box(obj: object, *, frame: str) -> dict[str, object]:
         "center_m": center_array.tolist(),
         "quaternion_xyzw": quaternion_array.tolist(),
         "extent_m": extent_array.tolist(),
-        "footprint_polygon_world_xy_m": _oriented_rectangle_xy(
-            center_array, quaternion_array, extent_array[:2]
-        ),
+        "footprint_polygon_world_xy_m": _oriented_rectangle_xy(center_array, quaternion_array, extent_array[:2]),
     }
 
 
@@ -175,14 +173,16 @@ def _contact_report(robot: object, radio: object, table: object) -> dict[str, ob
     return {
         "source_api": "ContactBodies.get_value()",
         "paths_by_subject": paths_by_subject,
-        "pairs": [
-            {"body_a": left, "body_b": right, "contact_body_path": path}
-            for left, right, path in sorted(pairs)
-        ],
+        "pairs": [{"body_a": left, "body_b": right, "contact_body_path": path} for left, right, path in sorted(pairs)],
     }
 
 
-def capture_navigation_geometry(env: object, robot: object) -> dict[str, object]:
+def capture_navigation_geometry(
+    env: object,
+    robot: object,
+    *,
+    backend_capabilities: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
     """Capture semantic state using task bindings and read-only simulator APIs."""
 
     radio, radio_identity = _task_bound_object(env, RADIO_TASK_BINDING)
@@ -208,6 +208,36 @@ def capture_navigation_geometry(env: object, robot: object) -> dict[str, object]
     )
     lower = np.min(points, axis=0) - SEARCH_MARGIN_M
     upper = np.max(points, axis=0) + SEARCH_MARGIN_M
+    capabilities: dict[str, Mapping[str, object]] = {
+        "semantic_pose_and_footprint": {"status": "available"},
+        "contact_and_support_state": {"status": "available"},
+        "hypothetical_base_pose_whole_arm_ik": {
+            "status": "unavailable",
+            "reason": "The current runtime exposes only local current-configuration linearized IK.",
+        },
+        "arm_trajectory_collision": {
+            "status": "unavailable",
+            "reason": "No read-only whole-corridor collision API is exposed by the current runtime.",
+        },
+        "arm_table_clearance": {
+            "status": "unavailable",
+            "reason": "No read-only articulated-link distance query is exposed by the current runtime.",
+        },
+    }
+    if backend_capabilities is not None:
+        capabilities.update(backend_capabilities)
+    missing_capability_note = (
+        "Whole-arm hypothetical-pose IK, collision, and arm-table clearance are unavailable."
+        if any(
+            capabilities[name].get("status") != "available"
+            for name in (
+                "hypothetical_base_pose_whole_arm_ik",
+                "arm_trajectory_collision",
+                "arm_table_clearance",
+            )
+        )
+        else "CuRobo whole-arm IK, articulated collision, and arm-table clearance are available in diagnostic mode."
+    )
     return {
         "frames": {
             "world": WORLD_FRAME,
@@ -244,31 +274,14 @@ def capture_navigation_geometry(env: object, robot: object) -> dict[str, object]
             ],
             "limitations": [
                 "Only the current task Radio and support-table collision footprints are semantic dynamic obstacles.",
-                "Whole-arm hypothetical-pose IK, collision, and arm-table clearance are unavailable.",
+                missing_capability_note,
             ],
         },
-        "capabilities": {
-            "semantic_pose_and_footprint": {"status": "available"},
-            "contact_and_support_state": {"status": "available"},
-            "hypothetical_base_pose_whole_arm_ik": {
-                "status": "unavailable",
-                "reason": "The current runtime exposes only local current-configuration linearized IK.",
-            },
-            "arm_trajectory_collision": {
-                "status": "unavailable",
-                "reason": "No read-only whole-corridor collision API is exposed by the current runtime.",
-            },
-            "arm_table_clearance": {
-                "status": "unavailable",
-                "reason": "No read-only articulated-link distance query is exposed by the current runtime.",
-            },
-        },
+        "capabilities": capabilities,
     }
 
 
-def navigation_geometry_deltas(
-    baseline: Mapping[str, object], current: Mapping[str, object]
-) -> dict[str, object]:
+def navigation_geometry_deltas(baseline: Mapping[str, object], current: Mapping[str, object]) -> dict[str, object]:
     def pose_delta(key: str) -> dict[str, object]:
         baseline_pose = baseline[key]["pose"]
         current_pose = current[key]["pose"]

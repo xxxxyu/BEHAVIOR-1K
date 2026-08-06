@@ -192,6 +192,42 @@ def test_semantic_navigation_geometry_websocket_dispatch_is_explicit_and_read_on
     assert runtime.calls == 1
 
 
+def test_semantic_corridor_websocket_dispatch_preserves_observation_binding_arguments():
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def evaluate_semantic_pickup_corridor(self, **request):
+            self.requests.append(request)
+            return {"observation_id": request["observation_id"], "read_only": True}
+
+    runtime = FakeRuntime()
+    server = AgenticEnvironmentWebsocketServer.__new__(AgenticEnvironmentWebsocketServer)
+    server.runtime = runtime
+    candidate = {"parent_frame": "simulator_world"}
+    targets = {"pregrasp": {"parent_frame": "simulator_world"}}
+
+    result = server._dispatch(
+        {
+            "operation": "evaluate_semantic_pickup_corridor",
+            "observation_id": "obs-550",
+            "env_step": 550,
+            "candidate_base_pose": candidate,
+            "target_poses": targets,
+        }
+    )
+
+    assert result == {"observation_id": "obs-550", "read_only": True}
+    assert runtime.requests == [
+        {
+            "observation_id": "obs-550",
+            "env_step": 550,
+            "candidate_base_pose": candidate,
+            "target_poses": targets,
+        }
+    ]
+
+
 class _FakeBridgeRuntime:
     def __init__(self) -> None:
         self.metadata_threads: list[int] = []
