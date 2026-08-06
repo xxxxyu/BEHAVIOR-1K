@@ -182,6 +182,40 @@ def test_joint_interpolation_respects_declared_maximum_increment():
     assert float(th.max(th.abs(th.diff(trajectory, dim=0)))) <= INTERPOLATION_MAX_JOINT_DELTA_RAD
 
 
+def test_g013_provenance_trajectory_changes_only_right_arm_and_gripper_indices():
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    start = th.arange(14, dtype=th.float32)
+    arm_indices = th.tensor([1, 3, 5, 7, 9, 11, 13])
+    gripper_indices = th.tensor([0, 2])
+    start[gripper_indices] = th.tensor([0.05, 0.05])
+    branch = {
+        "open_gripper_joint_positions_m": [0.05, 0.05],
+        "closed_gripper_joint_positions_m": [0.021, 0.016],
+        "stages": {
+            "preclose": {
+                "right_arm_waypoints_rad": [[0.1] * 7, [0.2] * 7],
+                "interpolation_steps": [2, 3],
+            }
+        },
+    }
+
+    goal, trajectory, provenance = backend._provenance_trajectory(
+        start,
+        branch=branch,
+        stage_name="preclose",
+        arm_indices=arm_indices,
+        gripper_indices=gripper_indices,
+    )
+
+    unlocked = set(arm_indices.tolist() + gripper_indices.tolist())
+    locked = th.tensor([index for index in range(len(start)) if index not in unlocked])
+    assert trajectory.shape == (6, 14)
+    th.testing.assert_close(trajectory[:, locked], start[locked].expand(6, -1))
+    th.testing.assert_close(goal[arm_indices], th.full((7,), 0.2))
+    th.testing.assert_close(goal[gripper_indices], th.tensor([0.05, 0.05]))
+    assert provenance["interpolation_steps"] == [2, 3]
+
+
 def test_ik_goal_uses_existing_full_joint_state_without_reaugmenting_locked_joints():
     class _MotionGenerator:
         def __init__(self):

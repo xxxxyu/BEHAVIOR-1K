@@ -490,6 +490,7 @@ class AgenticEvaluatorRuntime:
         env_step: int,
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
+        joint_provenance: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Run privileged CuRobo corridor queries without changing simulator state."""
 
@@ -513,6 +514,7 @@ class AgenticEvaluatorRuntime:
         result = self._semantic_geometry_backend.evaluate_corridor(
             candidate_base_pose=candidate_base_pose,
             target_poses=target_poses,
+            joint_provenance=joint_provenance,
         )
         after_q = self.robot.get_joint_positions().detach().clone()
         after_geometry = capture_navigation_geometry(
@@ -1317,6 +1319,9 @@ class AgenticEnvironmentWebsocketServer:
                 env_step=int(request.get("env_step", -1)),
                 candidate_base_pose=candidate_base_pose,
                 target_poses=target_poses,
+                joint_provenance=request.get("joint_provenance")
+                if isinstance(request.get("joint_provenance"), Mapping)
+                else None,
             )
         if operation == "step":
             return self.runtime.step(request.get("action"))

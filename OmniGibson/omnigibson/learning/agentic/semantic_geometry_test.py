@@ -301,19 +301,27 @@ def test_semantic_corridor_runtime_is_observation_bound_and_preserves_simulator_
     before_q = robot.get_joint_positions()
     candidate = {"candidate": True}
     targets = {"targets": True}
+    provenance = {"branches": [{"branch_id": "g013-nominal-01"}]}
 
     result = runtime.evaluate_semantic_pickup_corridor(
         observation_id="obs-256-test",
         env_step=256,
         candidate_base_pose=candidate,
         target_poses=targets,
+        joint_provenance=provenance,
     )
 
     assert result["observation_id"] == "obs-256-test"
     assert result["env_step"] == 256
     assert result["read_only"] is True
     assert result["privileged"] is True
-    assert runtime._semantic_geometry_backend.requests == [{"candidate_base_pose": candidate, "target_poses": targets}]
+    assert runtime._semantic_geometry_backend.requests == [
+        {
+            "candidate_base_pose": candidate,
+            "target_poses": targets,
+            "joint_provenance": provenance,
+        }
+    ]
     assert env._current_step == 256
     assert th.equal(robot.get_joint_positions(), before_q)
 
