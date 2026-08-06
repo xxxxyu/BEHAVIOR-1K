@@ -12,6 +12,8 @@ from collections.abc import Mapping
 
 import torch as th
 
+from curobo.geom.sdf.world import CollisionQueryBuffer
+
 import omnigibson as og
 import omnigibson.lazy as lazy
 import omnigibson.utils.transform_utils as T
@@ -120,6 +122,18 @@ def _summarize_ik_solution(goal_q: th.Tensor) -> dict[str, object]:
         "feasible": True,
         "solution_joint_positions_rad": goal_q.detach().cpu().tolist(),
     }
+
+
+def _first_positive_sample(values: th.Tensor) -> int | None:
+    positive = values.detach().reshape(-1) > 0.0
+    indices = th.nonzero(positive, as_tuple=False).reshape(-1)
+    return int(indices[0].item()) if indices.numel() else None
+
+
+def _max_positive_value(values: th.Tensor) -> float | None:
+    values = values.detach().reshape(-1)
+    positive = values[values > 0.0]
+    return float(th.max(positive).cpu()) if positive.numel() else None
 
 
 class RadioSemanticGeometryBackend:
@@ -313,6 +327,84 @@ class RadioSemanticGeometryBackend:
             raise RuntimeError("CuRobo ARM model has no right-arm collision spheres.")
         return th.cat(indices).unique(sorted=True)
 
+    def _sphere_link_names(self, *, emb_sel: CuRoboEmbodimentSelection) -> dict[int, str]:
+        config = self.motion_generator.mg[emb_sel].kinematics.kinematics_config
+        sphere_to_link: dict[int, str] = {}
+        for link_name in config.link_name_to_idx_map:
+            for sphere_index in config.get_sphere_index_from_link_name(link_name).detach().cpu().tolist():
+                sphere_to_link[int(sphere_index)] = link_name
+        return sphere_to_link
+
+    def _collision_channels(
+        self,
+        trajectory: th.Tensor,
+        *,
+        initial_joint_pos: th.Tensor,
+    ) -> dict[str, object]:
+        """Evaluate world and self collision constraints independently.
+
+        ``check_collisions`` intentionally returns their union.  The diagnostic needs
+        the two channels separately so a conservative self-collision model cannot be
+        mistaken for a table or scene collision.
+        """
+
+        emb_sel = CuRoboEmbodimentSelection.DEFAULT
+        initial_state = lazy.curobo.types.state.JointState(
+            position=self.motion_generator.tensor_args.to_device(initial_joint_pos.unsqueeze(0)),
+            joint_names=self.motion_generator.robot_joint_names,
+        )
+        self.motion_generator.update_locked_joints(initial_state, emb_sel)
+        joint_state = lazy.curobo.types.state.JointState(
+            position=self.motion_generator.tensor_args.to_device(trajectory),
+            joint_names=self.motion_generator.robot_joint_names,
+        ).get_ordered_joint_state(self.motion_generator.mg[emb_sel].kinematics.joint_names)
+        robot_spheres = self.motion_generator.mg[emb_sel].compute_kinematics(joint_state).robot_spheres
+        robot_spheres = robot_spheres.unsqueeze(1)
+        rollout = self.motion_generator.mg[emb_sel].rollout_fn
+        with th.no_grad():
+            world_constraint = rollout.primitive_collision_constraint.forward(robot_spheres).squeeze(1)
+            self_constraint = rollout.robot_self_collision_constraint.forward(robot_spheres).squeeze(1)
+
+        world_cost = rollout.primitive_collision_constraint
+        query_buffer = CollisionQueryBuffer()
+        query_buffer.update_buffer_shape(
+            robot_spheres.shape,
+            self.motion_generator.tensor_args,
+            world_cost.world_coll_checker.collision_types,
+        )
+        with th.no_grad():
+            per_sphere_world = world_cost.world_coll_checker.get_sphere_distance(
+                robot_spheres,
+                query_buffer,
+                world_cost.weight,
+                world_cost.activation_distance,
+                return_loss=world_cost.return_loss,
+                sum_collisions=True,
+            )
+        if per_sphere_world.ndim == 2:
+            per_sphere_world = per_sphere_world.unsqueeze(-1)
+        sphere_to_link = self._sphere_link_names(emb_sel=emb_sel)
+        max_sphere = int(th.argmax(per_sphere_world).item() % per_sphere_world.shape[-1])
+        max_sphere_values = per_sphere_world[..., max_sphere]
+        return {
+            "world_constraint_score": world_constraint.detach().cpu().tolist(),
+            "self_constraint_score": self_constraint.detach().cpu().tolist(),
+            "world_collision": {
+                "detected": bool(th.any(world_constraint > 0.0).item()),
+                "first_collision_sample": _first_positive_sample(world_constraint),
+                "maximum_constraint_score": _max_positive_value(world_constraint),
+                "worst_sphere_index": max_sphere,
+                "worst_sphere_link": sphere_to_link.get(max_sphere),
+                "worst_sphere_maximum_score": _max_positive_value(max_sphere_values),
+            },
+            "self_collision": {
+                "detected": bool(th.any(self_constraint > 0.0).item()),
+                "first_collision_sample": _first_positive_sample(self_constraint),
+                "maximum_constraint_score": _max_positive_value(self_constraint),
+            },
+            "sphere_count": int(robot_spheres.shape[2]),
+        }
+
     def _table_clearance(self, trajectory: th.Tensor) -> dict[str, object]:
         self._ensure_table_checker()
         arm_mg = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM]
@@ -323,8 +415,6 @@ class RadioSemanticGeometryBackend:
         spheres = arm_mg.compute_kinematics(cu_joint_state).robot_spheres
         indices = self._right_arm_sphere_indices()
         spheres = spheres[:, indices, :].unsqueeze(0)
-        from curobo.geom.sdf.world import CollisionQueryBuffer
-
         if self._table_query_buffer is None:
             self._table_query_buffer = CollisionQueryBuffer()
         self._table_query_buffer.update_buffer_shape(
@@ -403,12 +493,11 @@ class RadioSemanticGeometryBackend:
                 break
             goal_q = self._ik_goal_joint_positions(joint_states[0], expected_shape=start_q.shape)
             trajectory = self._interpolated(start_q, goal_q)
-            collision = self.motion_generator.check_collisions(
-                trajectory,
-                initial_joint_pos=start_q,
-                self_collision_check=True,
-                skip_obstacle_update=True,
-            )
+            collision_channels = self._collision_channels(trajectory, initial_joint_pos=start_q)
+            world_collision = collision_channels["world_collision"]
+            self_collision = collision_channels["self_collision"]
+            collision = th.as_tensor(collision_channels["world_constraint_score"]) > 0.0
+            collision = collision | (th.as_tensor(collision_channels["self_constraint_score"]) > 0.0)
             collision_free = not bool(th.any(collision).item())
             collision_result = {
                 "status": "available",
@@ -419,6 +508,9 @@ class RadioSemanticGeometryBackend:
                     None,
                 ),
                 "model": "linear_joint_interpolation_checked_at_each_sample",
+                "world_collision": world_collision,
+                "self_collision": self_collision,
+                "collision_channels": collision_channels,
             }
             clearance = self._table_clearance(trajectory)
             stages[stage] = {

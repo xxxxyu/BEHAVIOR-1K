@@ -9,6 +9,8 @@ from omnigibson.learning.agentic.semantic_geometry_backend import RadioSemanticG
 from omnigibson.learning.agentic.semantic_geometry_backend import _quantize_pose
 from omnigibson.learning.agentic.semantic_geometry_backend import _quantize_tensor
 from omnigibson.learning.agentic.semantic_geometry_backend import _resolve_curobo_device
+from omnigibson.learning.agentic.semantic_geometry_backend import _first_positive_sample
+from omnigibson.learning.agentic.semantic_geometry_backend import _max_positive_value
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_ik_solution
 from omnigibson.macros import gm
@@ -45,6 +47,15 @@ def _pose(position):
         "translation_m": position,
         "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
+
+
+def test_collision_channel_summary_preserves_first_sample_and_positive_maximum():
+    values = th.tensor([-0.2, 0.0, 0.03, 0.01], dtype=th.float32)
+
+    assert _first_positive_sample(values) == 2
+    assert _max_positive_value(values) == pytest.approx(0.03)
+    assert _first_positive_sample(th.tensor([-1.0, 0.0])) is None
+    assert _max_positive_value(th.tensor([-1.0, 0.0])) is None
 
 
 def test_curobo_device_uses_explicit_omnigibson_gpu():
