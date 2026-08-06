@@ -12,8 +12,6 @@ from collections.abc import Mapping
 
 import torch as th
 
-from curobo.geom.sdf.world import CollisionQueryBuffer
-
 import omnigibson as og
 import omnigibson.lazy as lazy
 import omnigibson.utils.transform_utils as T
@@ -366,6 +364,8 @@ class RadioSemanticGeometryBackend:
             self_constraint = rollout.robot_self_collision_constraint.forward(robot_spheres).squeeze(1)
 
         world_cost = rollout.primitive_collision_constraint
+        from curobo.geom.sdf.world import CollisionQueryBuffer
+
         query_buffer = CollisionQueryBuffer()
         query_buffer.update_buffer_shape(
             robot_spheres.shape,
@@ -415,6 +415,8 @@ class RadioSemanticGeometryBackend:
         spheres = arm_mg.compute_kinematics(cu_joint_state).robot_spheres
         indices = self._right_arm_sphere_indices()
         spheres = spheres[:, indices, :].unsqueeze(0)
+        from curobo.geom.sdf.world import CollisionQueryBuffer
+
         if self._table_query_buffer is None:
             self._table_query_buffer = CollisionQueryBuffer()
         self._table_query_buffer.update_buffer_shape(
