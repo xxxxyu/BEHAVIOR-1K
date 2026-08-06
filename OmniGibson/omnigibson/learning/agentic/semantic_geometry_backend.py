@@ -129,6 +129,7 @@ class RadioSemanticGeometryBackend:
                 "status": "available",
                 "source_api": "CuRoboMotionGenerator.compute_trajectories(ARM,initial_joint_pos,ik_only=True)",
                 "model": "R1Pro arm embodiment with base and grippers locked to hypothetical joint state",
+                "seed_strategy": "reset CuRobo ARM IKSolver Halton generator before each corridor evaluation",
             },
             "arm_trajectory_collision": {
                 "status": "available",
@@ -168,6 +169,11 @@ class RadioSemanticGeometryBackend:
 
     def _candidate_joint_state_for_curobo(self, candidate_base_pose: Mapping[str, object]) -> th.Tensor:
         return self.motion_generator.tensor_args.to_device(self._candidate_joint_state(candidate_base_pose))
+
+    def _reset_ik_seed_generator(self) -> None:
+        """Make a read-only corridor query independent of prior diagnostic queries."""
+
+        self.motion_generator.mg[CuRoboEmbodimentSelection.ARM].ik_solver.reset_seed()
 
     def _table_world(self):
         robot_transform = T.pose_inv(T.pose2mat(self.robot.root_link.get_position_orientation()))
@@ -330,6 +336,7 @@ class RadioSemanticGeometryBackend:
     ) -> dict[str, object]:
         if tuple(target_poses) != CORRIDOR_STAGE_NAMES:
             raise ValueError(f"Target poses must contain {CORRIDOR_STAGE_NAMES} in order.")
+        self._reset_ik_seed_generator()
         candidate_q = self._candidate_joint_state_for_curobo(candidate_base_pose)
         self.motion_generator.update_obstacles()
         current_left_position, current_left_orientation = self._left_hold_pose(candidate_base_pose)

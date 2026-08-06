@@ -106,6 +106,34 @@ def test_candidate_joint_state_is_copied_to_curobo_device_before_ik():
     th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
 
 
+def test_corridor_ik_seed_generator_reset_is_scoped_to_arm_solver():
+    class _IkSolver:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset_seed(self):
+            self.reset_calls += 1
+
+    arm_solver = _IkSolver()
+    default_solver = _IkSolver()
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.motion_generator = type(
+        "_MotionGenerator",
+        (),
+        {
+            "mg": {
+                "arm": type("_ArmMotionGenerator", (), {"ik_solver": arm_solver})(),
+                "default": type("_DefaultMotionGenerator", (), {"ik_solver": default_solver})(),
+            }
+        },
+    )()
+
+    backend._reset_ik_seed_generator()
+
+    assert arm_solver.reset_calls == 1
+    assert default_solver.reset_calls == 0
+
+
 def test_left_hold_pose_is_carried_with_hypothetical_base_instead_of_world_fixed():
     backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
     backend.robot = _Robot()
