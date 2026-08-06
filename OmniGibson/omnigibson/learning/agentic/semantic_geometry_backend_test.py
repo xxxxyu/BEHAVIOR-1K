@@ -7,6 +7,7 @@ from omnigibson.learning.agentic.semantic_geometry_backend import INTERPOLATION_
 from omnigibson.learning.agentic.semantic_geometry_backend import RadioSemanticGeometryBackend
 from omnigibson.learning.agentic.semantic_geometry_backend import _resolve_curobo_device
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
+from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_ik_solution
 from omnigibson.macros import gm
 
 
@@ -207,3 +208,18 @@ def test_clearance_summary_marks_a_far_saturated_minimum_as_lower_bound():
     assert result["minimum_clearance_m"] == pytest.approx(0.95)
     assert result["clearance_is_lower_bound"] is True
     assert result["minimum_sample_esdf_saturated"] is True
+
+
+def test_ik_summary_retains_auditable_joint_values_instead_of_an_opaque_digest():
+    result = _summarize_ik_solution(th.tensor([0.1, -0.2, 0.3]))
+
+    assert result["status"] == "available"
+    assert result["feasible"] is True
+    assert result["solution_joint_positions_rad"] == pytest.approx([0.1, -0.2, 0.3])
+
+
+def test_ik_summary_rejects_nonfinite_or_nonvector_solutions():
+    with pytest.raises(ValueError, match="finite joint vector"):
+        _summarize_ik_solution(th.tensor([[0.0, 1.0]]))
+    with pytest.raises(ValueError, match="finite joint vector"):
+        _summarize_ik_solution(th.tensor([0.0, float("nan")]))

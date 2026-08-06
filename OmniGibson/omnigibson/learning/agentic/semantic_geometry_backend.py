@@ -98,6 +98,16 @@ def _summarize_clearance(
     }
 
 
+def _summarize_ik_solution(goal_q: th.Tensor) -> dict[str, object]:
+    if goal_q.ndim != 1 or not th.isfinite(goal_q).all():
+        raise ValueError("IK solution must be a finite joint vector.")
+    return {
+        "status": "available",
+        "feasible": True,
+        "solution_joint_positions_rad": goal_q.detach().cpu().tolist(),
+    }
+
+
 class RadioSemanticGeometryBackend:
     """CuRobo-backed geometry oracle with no simulator mutation."""
 
@@ -396,12 +406,7 @@ class RadioSemanticGeometryBackend:
             }
             clearance = self._table_clearance(trajectory)
             stages[stage] = {
-                "ik": {
-                    "status": "available",
-                    "feasible": True,
-                    "solution_digest": "sha256:"
-                    + hashlib.sha256(goal_q.detach().cpu().numpy().astype("<f4", copy=False).tobytes()).hexdigest(),
-                },
+                "ik": _summarize_ik_solution(goal_q),
                 "collision": collision_result,
                 "clearance": clearance,
             }
