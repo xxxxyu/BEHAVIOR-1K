@@ -452,6 +452,30 @@ def test_g013_lift_trajectory_closes_before_moving_the_arm():
     assert provenance["gripper_close_interpolation_steps"] == 4
 
 
+def test_right_eef_pose_clones_reused_curobo_fk_buffers():
+    class _Kinematics:
+        def __init__(self):
+            self.position = th.tensor([[1.0, 2.0, 3.0]])
+            self.quaternion = th.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+        def compute_kinematics(self, _joint_state):
+            pose = type("_Pose", (), {"position": self.position, "quaternion": self.quaternion})()
+            return type("_Result", (), {"link_poses": {"right_eef": pose}})()
+
+    kinematics = _Kinematics()
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.motion_generator = type("_MotionGenerator", (), {"mg": {"arm": kinematics}})()
+    backend.robot = type("_Robot", (), {"eef_link_names": {"right": "right_eef"}})()
+    backend._ordered_joint_state_for_curobo = lambda *_args, **_kwargs: object()
+
+    position, orientation = backend._right_eef_pose_for_joint_positions(th.zeros(1))
+    kinematics.position.fill_(9.0)
+    kinematics.quaternion.fill_(0.5)
+
+    th.testing.assert_close(position, th.tensor([1.0, 2.0, 3.0]))
+    th.testing.assert_close(orientation, th.tensor([0.0, 0.0, 0.0, 1.0]))
+
+
 def test_ik_goal_uses_existing_full_joint_state_without_reaugmenting_locked_joints():
     class _MotionGenerator:
         def __init__(self):

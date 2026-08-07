@@ -821,8 +821,8 @@ class RadioSemanticGeometryBackend:
         )
         link_pose = arm_mg.compute_kinematics(joint_state).link_poses[self.robot.eef_link_names["right"]]
         return (
-            link_pose.position.reshape(-1, 3)[-1],
-            link_pose.quaternion.reshape(-1, 4)[-1][[1, 2, 3, 0]],
+            link_pose.position.reshape(-1, 3)[-1].detach().clone(),
+            link_pose.quaternion.reshape(-1, 4)[-1][[1, 2, 3, 0]].detach().clone(),
         )
 
     def _right_eef_target_comparison(
