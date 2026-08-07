@@ -124,14 +124,17 @@ def test_stage_collision_policy_never_suppresses_non_target_or_self_collision():
 
 
 def test_retained_lift_motion_uses_relative_positive_z_and_cumulative_xy_contract():
-    gate = {
-        "stage_names": ["lift_1", "lift_2"],
-        "lift_count": 2,
-        "axis": "robot_base_footprint:+z",
-        "increment_max_m": 0.025,
-        "actions_per_lift_max": 18,
-        "cumulative_eef_xy_drift_max_m": 0.01,
-        "radio_local_feature_following_required": True,
+    contract = {
+        "gate": {
+            "stage_names": ["lift_1", "lift_2"],
+            "lift_count": 2,
+            "axis": "robot_base_footprint:+z",
+            "increment_max_m": 0.025,
+            "actions_per_lift_max": 18,
+            "cumulative_eef_xy_drift_max_m": 0.01,
+            "radio_local_feature_following_required": True,
+        },
+        "measurement_bounds": {"increment_target_m": 0.025, "increment_tolerance_m": 0.0005},
     }
 
     accepted = _summarize_retained_lift_motion(
@@ -140,7 +143,7 @@ def test_retained_lift_motion_uses_relative_positive_z_and_cumulative_xy_contrac
         th.tensor([0.56632, -0.17154, 0.66346]),
         th.tensor([0.56876, -0.17226, 0.63901]),
         interpolation_steps=18,
-        gate=gate,
+        contract=contract,
     )
 
     assert accepted["accepted"] is True
@@ -154,11 +157,12 @@ def test_retained_lift_motion_uses_relative_positive_z_and_cumulative_xy_contrac
         th.tensor([0.58000, -0.17154, 0.66200]),
         th.tensor([0.56876, -0.17226, 0.63901]),
         interpolation_steps=19,
-        gate=gate,
+        contract=contract,
     )
     assert rejected["accepted"] is False
     assert rejected["blocking_reasons"] == [
         "lift_does_not_move_in_positive_base_z",
+        "lift_displacement_misses_target",
         "cumulative_eef_xy_drift_exceeds_max",
         "lift_interpolation_steps_exceed_max",
     ]

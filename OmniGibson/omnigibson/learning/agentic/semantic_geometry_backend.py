@@ -256,6 +256,27 @@ def _validate_retained_lift_gate(value: Mapping[str, object]) -> dict[str, objec
     return validated
 
 
+def _validate_retained_lift_motion_contract(value: Mapping[str, object]) -> dict[str, object]:
+    gate = value.get("gate")
+    bounds = value.get("measurement_bounds")
+    if not isinstance(gate, Mapping) or not isinstance(bounds, Mapping):
+        raise ValueError("Retained-lift motion contract requires gate and measurement_bounds objects.")
+    if set(bounds) != {"increment_target_m", "increment_tolerance_m"}:
+        raise ValueError("Retained-lift measurement bounds must declare target and tolerance only.")
+    validated_bounds = {}
+    for name in ("increment_target_m", "increment_tolerance_m"):
+        threshold = bounds.get(name)
+        if (
+            not isinstance(threshold, int | float)
+            or isinstance(threshold, bool)
+            or not math.isfinite(threshold)
+            or threshold <= 0.0
+        ):
+            raise ValueError(f"Retained-lift measurement bound {name!r} must be finite and positive.")
+        validated_bounds[name] = float(threshold)
+    return {"gate": _validate_retained_lift_gate(gate), "measurement_bounds": validated_bounds}
+
+
 def _summarize_retained_lift_motion(
     stage_name: str,
     start_position: th.Tensor,
@@ -263,11 +284,13 @@ def _summarize_retained_lift_motion(
     preclose_position: th.Tensor,
     *,
     interpolation_steps: int,
-    gate: Mapping[str, object],
+    contract: Mapping[str, object],
 ) -> dict[str, object]:
     """Evaluate a frozen G013 lift by its declared relative-motion contract."""
 
-    validated_gate = _validate_retained_lift_gate(gate)
+    validated_contract = _validate_retained_lift_motion_contract(contract)
+    validated_gate = validated_contract["gate"]
+    measurement_bounds = validated_contract["measurement_bounds"]
     if stage_name not in validated_gate["stage_names"]:
         raise ValueError(f"Stage {stage_name!r} is not a retained-lift stage.")
     if interpolation_steps <= 0:
@@ -284,22 +307,26 @@ def _summarize_retained_lift_motion(
     displacement = float(th.linalg.vector_norm(delta).detach().cpu())
     z_rise = float(delta[2].detach().cpu())
     cumulative_xy_drift = float(th.linalg.vector_norm(end_position[:2] - preclose_position[:2]).detach().cpu())
+    increment_target_residual = abs(displacement - measurement_bounds["increment_target_m"])
     reasons = []
     if z_rise <= 0.0:
         reasons.append("lift_does_not_move_in_positive_base_z")
-    if displacement > validated_gate["increment_max_m"] + 1e-9:
+    if displacement > validated_gate["increment_max_m"] + measurement_bounds["increment_tolerance_m"] + 1e-9:
         reasons.append("lift_displacement_exceeds_increment_max")
+    if increment_target_residual > measurement_bounds["increment_tolerance_m"] + 1e-9:
+        reasons.append("lift_displacement_misses_target")
     if cumulative_xy_drift > validated_gate["cumulative_eef_xy_drift_max_m"] + 1e-9:
         reasons.append("cumulative_eef_xy_drift_exceeds_max")
     if interpolation_steps > validated_gate["actions_per_lift_max"]:
         reasons.append("lift_interpolation_steps_exceed_max")
     return {
-        "gate": validated_gate,
+        "contract": validated_contract,
         "stage": stage_name,
         "start_position_in_kinematic_base_m": start_position.detach().cpu().tolist(),
         "end_position_in_kinematic_base_m": end_position.detach().cpu().tolist(),
         "delta_xyz_in_kinematic_base_m": delta.detach().cpu().tolist(),
         "displacement_m": displacement,
+        "increment_target_residual_m": increment_target_residual,
         "z_rise_m": z_rise,
         "cumulative_eef_xy_drift_from_preclose_m": cumulative_xy_drift,
         "interpolation_steps": interpolation_steps,
@@ -905,7 +932,7 @@ class RadioSemanticGeometryBackend:
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
         branch: Mapping[str, object],
-        retained_lift_gate: Mapping[str, object],
+        retained_lift_motion_contract: Mapping[str, object],
     ) -> dict[str, object]:
         arm_indices, gripper_indices = self._provenance_indices()
         start_q = self._candidate_joint_state_for_curobo(candidate_base_pose)
@@ -961,7 +988,7 @@ class RadioSemanticGeometryBackend:
                     motion_end_position,
                     preclose_eef_position,
                     interpolation_steps=sum(provenance["interpolation_steps"]),
-                    gate=retained_lift_gate,
+                    contract=retained_lift_motion_contract,
                 )
                 lift_motion.update(
                     {
@@ -1070,14 +1097,14 @@ class RadioSemanticGeometryBackend:
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
         joint_provenance: Mapping[str, object] | None = None,
-        retained_lift_gate: Mapping[str, object] | None = None,
+        retained_lift_motion_contract: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if tuple(target_poses) != CORRIDOR_STAGE_NAMES:
             raise ValueError(f"Target poses must contain {CORRIDOR_STAGE_NAMES} in order.")
         if joint_provenance is not None:
-            if retained_lift_gate is None:
-                raise ValueError("G013 joint provenance requires a retained-lift gate.")
-            retained_lift_gate = _validate_retained_lift_gate(retained_lift_gate)
+            if retained_lift_motion_contract is None:
+                raise ValueError("G013 joint provenance requires a retained-lift motion contract.")
+            retained_lift_motion_contract = _validate_retained_lift_motion_contract(retained_lift_motion_contract)
             branches = joint_provenance.get("branches")
             if not isinstance(branches, list) or not branches:
                 raise ValueError("G013 joint provenance must contain a non-empty branches list.")
@@ -1086,7 +1113,7 @@ class RadioSemanticGeometryBackend:
                     candidate_base_pose=candidate_base_pose,
                     target_poses=target_poses,
                     branch=branch,
-                    retained_lift_gate=retained_lift_gate,
+                    retained_lift_motion_contract=retained_lift_motion_contract,
                 )
                 for branch in branches
             ]
