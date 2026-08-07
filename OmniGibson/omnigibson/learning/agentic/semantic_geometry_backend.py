@@ -296,6 +296,21 @@ class RadioSemanticGeometryBackend:
     def _target_pose(self, value: Mapping[str, object], stage: str) -> tuple[th.Tensor, th.Tensor]:
         return _quantize_pose(*_as_pose(value, parent="simulator_world", child=f"right_eef_{stage}"))
 
+    def _target_pose_for_curobo(
+        self,
+        value: Mapping[str, object],
+        stage: str,
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """Express a world-frame target in CuRobo's kinematic base frame."""
+
+        target_position, target_orientation = self._target_pose(value, stage)
+        base_link_name = self.motion_generator.base_link[CuRoboEmbodimentSelection.ARM]
+        base_position, base_orientation = self.robot.links[base_link_name].get_position_orientation()
+        target_position = target_position.to(device=base_position.device, dtype=base_position.dtype)
+        target_orientation = target_orientation.to(device=base_orientation.device, dtype=base_orientation.dtype)
+        base_inverse = T.invert_pose_transform(base_position, base_orientation)
+        return _quantize_pose(*T.pose_transform(*base_inverse, target_position, target_orientation))
+
     def _left_hold_pose(self, candidate_base_pose: Mapping[str, object]) -> tuple[th.Tensor, th.Tensor]:
         """Carry the current base-relative left EEF pose to the hypothetical base."""
 
@@ -534,7 +549,7 @@ class RadioSemanticGeometryBackend:
         target_pose: Mapping[str, object],
         stage_name: str,
     ) -> dict[str, float]:
-        target_position, target_orientation = self._target_pose(target_pose, stage_name)
+        target_position, target_orientation = self._target_pose_for_curobo(target_pose, stage_name)
         arm_mg = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM]
         joint_state = lazy.curobo.types.state.JointState(
             position=self.motion_generator.tensor_args.to_device(joint_positions.unsqueeze(0)),
@@ -636,7 +651,20 @@ class RadioSemanticGeometryBackend:
                     "provenance": {"source": "g013_frozen_right_arm_joint_path", "branch_id": branch["branch_id"]},
                 },
             )
-        return {"branch_id": branch["branch_id"], "source_run": branch["source_run"], "stages": stages}
+        return {
+            "branch_id": branch["branch_id"],
+            "source_run": branch["source_run"],
+            "joint_provenance": {
+                "source": "g013_frozen_right_arm_joint_path",
+                "source_generation": "013",
+                "source_fixture_environment_step": 550,
+                "branch_id": branch["branch_id"],
+                "source_run": branch["source_run"],
+                "arm": "right",
+                "locked_segments": ["base", "trunk", "arm_left", "gripper_left"],
+            },
+            "stages": stages,
+        }
 
     def evaluate_corridor(
         self,

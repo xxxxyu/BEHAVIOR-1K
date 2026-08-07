@@ -145,6 +145,28 @@ def test_candidate_joint_state_is_copied_to_curobo_device_before_ik():
     th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
 
 
+def test_world_target_is_expressed_in_curobo_base_frame_before_fk_comparison():
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.robot = _Robot()
+    backend.robot.links = {"base_footprint_x": backend.robot.root_link}
+    backend.motion_generator = type(
+        "_MotionGenerator",
+        (),
+        {"base_link": {"arm": "base_footprint_x"}},
+    )()
+    target = {
+        "parent_frame": "simulator_world",
+        "child_frame": "right_eef_pregrasp",
+        "translation_m": [10.54, 19.79, 0.64],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+
+    position, orientation = backend._target_pose_for_curobo(target, "pregrasp")
+
+    th.testing.assert_close(position, th.tensor([0.54, -0.21, 0.64]), atol=1e-4, rtol=0.0)
+    th.testing.assert_close(orientation, th.tensor([0.0, 0.0, 0.0, 1.0]))
+
+
 def test_solver_inputs_quantize_restore_noise_without_losing_quaternion_normalization():
     assert DIAGNOSTIC_SOLVER_INPUT_QUANTUM == 1e-4
     left = th.tensor([1.234561, -0.500001])
