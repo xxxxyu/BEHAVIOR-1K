@@ -16,6 +16,7 @@ from omnigibson.learning.agentic.semantic_geometry_backend import _stage_collisi
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_ik_solution
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_per_sphere_collision
+from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_retained_lift_motion
 from omnigibson.macros import gm
 
 
@@ -120,6 +121,47 @@ def test_stage_collision_policy_never_suppresses_non_target_or_self_collision():
     assert result["target_contact_allowed"] is True
     assert result["collision_safe_for_stage"] is False
     assert result["blocking_reasons"] == ["self_collision", "non_target_world_collision"]
+
+
+def test_retained_lift_motion_uses_relative_positive_z_and_cumulative_xy_contract():
+    gate = {
+        "stage_names": ["lift_1", "lift_2"],
+        "lift_count": 2,
+        "axis": "robot_base_footprint:+z",
+        "increment_max_m": 0.025,
+        "actions_per_lift_max": 18,
+        "cumulative_eef_xy_drift_max_m": 0.01,
+        "radio_local_feature_following_required": True,
+    }
+
+    accepted = _summarize_retained_lift_motion(
+        "lift_1",
+        th.tensor([0.56876, -0.17226, 0.63901]),
+        th.tensor([0.56632, -0.17154, 0.66346]),
+        th.tensor([0.56876, -0.17226, 0.63901]),
+        interpolation_steps=18,
+        gate=gate,
+    )
+
+    assert accepted["accepted"] is True
+    assert accepted["z_rise_m"] == pytest.approx(0.02445, abs=1e-6)
+    assert accepted["displacement_m"] < 0.025
+    assert accepted["cumulative_eef_xy_drift_from_preclose_m"] < 0.01
+
+    rejected = _summarize_retained_lift_motion(
+        "lift_2",
+        th.tensor([0.56632, -0.17154, 0.66346]),
+        th.tensor([0.58000, -0.17154, 0.66200]),
+        th.tensor([0.56876, -0.17226, 0.63901]),
+        interpolation_steps=19,
+        gate=gate,
+    )
+    assert rejected["accepted"] is False
+    assert rejected["blocking_reasons"] == [
+        "lift_does_not_move_in_positive_base_z",
+        "cumulative_eef_xy_drift_exceeds_max",
+        "lift_interpolation_steps_exceed_max",
+    ]
 
 
 def test_pose_residual_aligns_target_dtype_with_fk_output():

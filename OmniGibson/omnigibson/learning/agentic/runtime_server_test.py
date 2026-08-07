@@ -225,6 +225,7 @@ def test_semantic_corridor_websocket_dispatch_preserves_observation_binding_argu
             "candidate_base_pose": candidate,
             "target_poses": targets,
             "joint_provenance": None,
+            "retained_lift_gate": None,
         }
     ]
 

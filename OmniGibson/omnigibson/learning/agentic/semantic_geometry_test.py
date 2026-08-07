@@ -302,6 +302,7 @@ def test_semantic_corridor_runtime_is_observation_bound_and_preserves_simulator_
     candidate = {"candidate": True}
     targets = {"targets": True}
     provenance = {"branches": [{"branch_id": "g013-nominal-01"}]}
+    retained_lift_gate = {"stage_names": ["lift_1", "lift_2"]}
 
     result = runtime.evaluate_semantic_pickup_corridor(
         observation_id="obs-256-test",
@@ -309,6 +310,7 @@ def test_semantic_corridor_runtime_is_observation_bound_and_preserves_simulator_
         candidate_base_pose=candidate,
         target_poses=targets,
         joint_provenance=provenance,
+        retained_lift_gate=retained_lift_gate,
     )
 
     assert result["observation_id"] == "obs-256-test"
@@ -320,6 +322,7 @@ def test_semantic_corridor_runtime_is_observation_bound_and_preserves_simulator_
             "candidate_base_pose": candidate,
             "target_poses": targets,
             "joint_provenance": provenance,
+            "retained_lift_gate": retained_lift_gate,
         }
     ]
     assert env._current_step == 256

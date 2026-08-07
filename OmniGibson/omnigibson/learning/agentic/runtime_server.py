@@ -491,6 +491,7 @@ class AgenticEvaluatorRuntime:
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
         joint_provenance: Mapping[str, object] | None = None,
+        retained_lift_gate: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """Run privileged CuRobo corridor queries without changing simulator state."""
 
@@ -515,6 +516,7 @@ class AgenticEvaluatorRuntime:
             candidate_base_pose=candidate_base_pose,
             target_poses=target_poses,
             joint_provenance=joint_provenance,
+            retained_lift_gate=retained_lift_gate,
         )
         after_q = self.robot.get_joint_positions().detach().clone()
         after_geometry = capture_navigation_geometry(
@@ -1321,6 +1323,9 @@ class AgenticEnvironmentWebsocketServer:
                 target_poses=target_poses,
                 joint_provenance=request.get("joint_provenance")
                 if isinstance(request.get("joint_provenance"), Mapping)
+                else None,
+                retained_lift_gate=request.get("retained_lift_gate")
+                if isinstance(request.get("retained_lift_gate"), Mapping)
                 else None,
             )
         if operation == "step":

@@ -229,6 +229,85 @@ def _stage_collision_policy(
     }
 
 
+def _validate_retained_lift_gate(value: Mapping[str, object]) -> dict[str, object]:
+    """Validate the lift subset of the immutable Radio grasp contract."""
+
+    stages = value.get("stage_names")
+    if stages != ["lift_1", "lift_2"] or value.get("lift_count") != 2:
+        raise ValueError("Retained-lift gate must declare the two ordered Radio lift stages.")
+    if value.get("axis") != "robot_base_footprint:+z":
+        raise ValueError("Retained-lift gate must use the robot-base +z axis.")
+    if value.get("radio_local_feature_following_required") is not True:
+        raise ValueError("Retained-lift gate must require Radio-local feature following.")
+    validated = dict(value)
+    for name in ("increment_max_m", "cumulative_eef_xy_drift_max_m"):
+        threshold = value.get(name)
+        if (
+            not isinstance(threshold, int | float)
+            or isinstance(threshold, bool)
+            or not math.isfinite(threshold)
+            or threshold <= 0.0
+        ):
+            raise ValueError(f"Retained-lift gate {name!r} must be finite and positive.")
+        validated[name] = float(threshold)
+    actions_max = value.get("actions_per_lift_max")
+    if not isinstance(actions_max, int) or isinstance(actions_max, bool) or actions_max <= 0:
+        raise ValueError("Retained-lift gate actions_per_lift_max must be a positive integer.")
+    return validated
+
+
+def _summarize_retained_lift_motion(
+    stage_name: str,
+    start_position: th.Tensor,
+    end_position: th.Tensor,
+    preclose_position: th.Tensor,
+    *,
+    interpolation_steps: int,
+    gate: Mapping[str, object],
+) -> dict[str, object]:
+    """Evaluate a frozen G013 lift by its declared relative-motion contract."""
+
+    validated_gate = _validate_retained_lift_gate(gate)
+    if stage_name not in validated_gate["stage_names"]:
+        raise ValueError(f"Stage {stage_name!r} is not a retained-lift stage.")
+    if interpolation_steps <= 0:
+        raise ValueError("Lift interpolation steps must be positive.")
+    start_position = th.as_tensor(start_position)
+    end_position = th.as_tensor(end_position, device=start_position.device, dtype=start_position.dtype)
+    preclose_position = th.as_tensor(preclose_position, device=start_position.device, dtype=start_position.dtype)
+    if any(position.shape != (3,) for position in (start_position, end_position, preclose_position)):
+        raise ValueError("Retained-lift positions must be three-vectors.")
+    if not all(bool(th.isfinite(position).all()) for position in (start_position, end_position, preclose_position)):
+        raise ValueError("Retained-lift positions must be finite.")
+
+    delta = end_position - start_position
+    displacement = float(th.linalg.vector_norm(delta).detach().cpu())
+    z_rise = float(delta[2].detach().cpu())
+    cumulative_xy_drift = float(th.linalg.vector_norm(end_position[:2] - preclose_position[:2]).detach().cpu())
+    reasons = []
+    if z_rise <= 0.0:
+        reasons.append("lift_does_not_move_in_positive_base_z")
+    if displacement > validated_gate["increment_max_m"] + 1e-9:
+        reasons.append("lift_displacement_exceeds_increment_max")
+    if cumulative_xy_drift > validated_gate["cumulative_eef_xy_drift_max_m"] + 1e-9:
+        reasons.append("cumulative_eef_xy_drift_exceeds_max")
+    if interpolation_steps > validated_gate["actions_per_lift_max"]:
+        reasons.append("lift_interpolation_steps_exceed_max")
+    return {
+        "gate": validated_gate,
+        "stage": stage_name,
+        "start_position_in_kinematic_base_m": start_position.detach().cpu().tolist(),
+        "end_position_in_kinematic_base_m": end_position.detach().cpu().tolist(),
+        "delta_xyz_in_kinematic_base_m": delta.detach().cpu().tolist(),
+        "displacement_m": displacement,
+        "z_rise_m": z_rise,
+        "cumulative_eef_xy_drift_from_preclose_m": cumulative_xy_drift,
+        "interpolation_steps": interpolation_steps,
+        "blocking_reasons": reasons,
+        "accepted": not reasons,
+    }
+
+
 class RadioSemanticGeometryBackend:
     """CuRobo-backed geometry oracle with no simulator mutation."""
 
@@ -826,12 +905,14 @@ class RadioSemanticGeometryBackend:
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
         branch: Mapping[str, object],
+        retained_lift_gate: Mapping[str, object],
     ) -> dict[str, object]:
         arm_indices, gripper_indices = self._provenance_indices()
         start_q = self._candidate_joint_state_for_curobo(candidate_base_pose)
         candidate_joint_state_diagnostic = self._candidate_joint_state_diagnostic(start_q)
         self.motion_generator.update_obstacles()
         stages: dict[str, object] = {}
+        preclose_eef_position = None
         for stage_name in CORRIDOR_STAGE_NAMES:
             try:
                 goal_q, trajectory, provenance = self._provenance_trajectory(
@@ -855,18 +936,59 @@ class RadioSemanticGeometryBackend:
                 stage_name=stage_name,
             )
             target_residual = target_comparison["residual"]
-            target_matches = (
-                target_residual["translation_m"] <= PROVENANCE_TARGET_TRANSLATION_TOLERANCE_M
-                and target_residual["orientation_rad"] <= PROVENANCE_TARGET_ORIENTATION_TOLERANCE_RAD
-            )
-            if not target_matches:
+            if stage_name in ("pregrasp", "preclose"):
+                endpoint_gate = {
+                    "policy": "strict_semantic_target_pose",
+                    "translation_tolerance_m": PROVENANCE_TARGET_TRANSLATION_TOLERANCE_M,
+                    "orientation_tolerance_rad": PROVENANCE_TARGET_ORIENTATION_TOLERANCE_RAD,
+                    "accepted": (
+                        target_residual["translation_m"] <= PROVENANCE_TARGET_TRANSLATION_TOLERANCE_M
+                        and target_residual["orientation_rad"] <= PROVENANCE_TARGET_ORIENTATION_TOLERANCE_RAD
+                    ),
+                }
+            else:
+                if preclose_eef_position is None:
+                    raise RuntimeError("Retained-lift validation requires an accepted preclose endpoint.")
+                motion_start_sample = int(provenance["gripper_close_interpolation_steps"] or 0)
+                motion_start_q = trajectory[motion_start_sample]
+                motion_start_position, motion_start_orientation = self._right_eef_pose_for_joint_positions(
+                    motion_start_q
+                )
+                motion_end_position, motion_end_orientation = self._right_eef_pose_for_joint_positions(goal_q)
+                lift_motion = _summarize_retained_lift_motion(
+                    stage_name,
+                    motion_start_position,
+                    motion_end_position,
+                    preclose_eef_position,
+                    interpolation_steps=sum(provenance["interpolation_steps"]),
+                    gate=retained_lift_gate,
+                )
+                lift_motion.update(
+                    {
+                        "start_orientation_in_kinematic_base_xyzw": motion_start_orientation.detach().cpu().tolist(),
+                        "end_orientation_in_kinematic_base_xyzw": motion_end_orientation.detach().cpu().tolist(),
+                        "semantic_target_residual_reported_but_not_used_for_acceptance": target_residual,
+                    }
+                )
+                provenance["retained_lift_motion"] = lift_motion
+                endpoint_gate = {
+                    "policy": "declared_retained_lift_motion",
+                    "accepted": lift_motion["accepted"],
+                    "blocking_reasons": lift_motion["blocking_reasons"],
+                }
+            if endpoint_gate["accepted"] is not True:
                 stages[stage_name] = {
                     "ik": {
                         "status": "available",
                         "feasible": False,
-                        "reason": "provenance_endpoint_misses_semantic_target",
+                        "reason": (
+                            "provenance_endpoint_misses_semantic_target"
+                            if stage_name in ("pregrasp", "preclose")
+                            else "provenance_lift_motion_violates_contract"
+                        ),
                         "target_residual": target_residual,
                         "kinematic_comparison": target_comparison,
+                        "endpoint_gate": endpoint_gate,
                     },
                     "collision": {"status": "not_evaluated", "collision_free": False, "reason": "ik_failed"},
                     "clearance": {"status": "not_evaluated", "reason": "ik_failed"},
@@ -894,6 +1016,7 @@ class RadioSemanticGeometryBackend:
                     "solution_joint_positions_rad": goal_q.detach().cpu().tolist(),
                     "target_residual": target_residual,
                     "kinematic_comparison": target_comparison,
+                    "endpoint_gate": endpoint_gate,
                 },
                 "collision": {
                     "status": "available",
@@ -912,6 +1035,8 @@ class RadioSemanticGeometryBackend:
             }
             if not collision_safe:
                 break
+            if stage_name == "preclose":
+                preclose_eef_position, _ = self._right_eef_pose_for_joint_positions(goal_q)
             start_q = goal_q
         for stage_name in CORRIDOR_STAGE_NAMES:
             stages.setdefault(
@@ -945,10 +1070,14 @@ class RadioSemanticGeometryBackend:
         candidate_base_pose: Mapping[str, object],
         target_poses: Mapping[str, Mapping[str, object]],
         joint_provenance: Mapping[str, object] | None = None,
+        retained_lift_gate: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         if tuple(target_poses) != CORRIDOR_STAGE_NAMES:
             raise ValueError(f"Target poses must contain {CORRIDOR_STAGE_NAMES} in order.")
         if joint_provenance is not None:
+            if retained_lift_gate is None:
+                raise ValueError("G013 joint provenance requires a retained-lift gate.")
+            retained_lift_gate = _validate_retained_lift_gate(retained_lift_gate)
             branches = joint_provenance.get("branches")
             if not isinstance(branches, list) or not branches:
                 raise ValueError("G013 joint provenance must contain a non-empty branches list.")
@@ -957,6 +1086,7 @@ class RadioSemanticGeometryBackend:
                     candidate_base_pose=candidate_base_pose,
                     target_poses=target_poses,
                     branch=branch,
+                    retained_lift_gate=retained_lift_gate,
                 )
                 for branch in branches
             ]
