@@ -18,6 +18,7 @@ import omnigibson.utils.transform_utils as T
 from omnigibson.action_primitives.curobo import CuRoboEmbodimentSelection
 from omnigibson.action_primitives.curobo import CuRoboMotionGenerator
 from omnigibson.action_primitives.curobo import create_world_mesh_collision
+from omnigibson.learning.agentic.semantic_geometry import RADIO_TASK_BINDING
 from omnigibson.macros import gm
 
 
@@ -151,6 +152,81 @@ def _max_positive_value(values: object) -> float | None:
     values = th.as_tensor(values).detach().reshape(-1)
     positive = values[values > 0.0]
     return float(th.max(positive).cpu()) if positive.numel() else None
+
+
+def _summarize_per_sphere_collision(
+    values: th.Tensor,
+    *,
+    sphere_to_link: Mapping[int, str],
+) -> tuple[th.Tensor, dict[str, object]]:
+    """Summarize per-sphere world cost without losing the colliding robot link."""
+
+    if values.ndim < 2:
+        raise ValueError("Per-sphere collision scores must include sample and sphere dimensions.")
+    sphere_count = int(values.shape[-1])
+    sample_scores = th.sum(values, dim=-1).reshape(-1)
+    flat_values = values.reshape(-1, sphere_count)
+    worst_flat_index = int(th.argmax(flat_values).item())
+    worst_sphere_index = worst_flat_index % sphere_count
+    worst_sphere_values = flat_values[:, worst_sphere_index]
+    return sample_scores, {
+        "detected": bool(th.any(sample_scores > 0.0).item()),
+        "first_collision_sample": _first_positive_sample(sample_scores),
+        "maximum_constraint_score": _max_positive_value(sample_scores),
+        "worst_sphere_index": worst_sphere_index,
+        "worst_sphere_link": sphere_to_link.get(worst_sphere_index),
+        "worst_sphere_maximum_score": _max_positive_value(worst_sphere_values),
+    }
+
+
+def _stage_collision_policy(
+    stage_name: str,
+    collision_channels: Mapping[str, object],
+    *,
+    contact_phase_start_sample: int | None,
+) -> dict[str, object]:
+    """Allow only exact target-Radio contact in the grasp-contact corridor."""
+
+    target = collision_channels["target_object_collision"]
+    non_target = collision_channels["non_target_world_collision"]
+    self_collision = collision_channels["self_collision"]
+    target_detected = target.get("detected") is True
+    target_first = target.get("first_collision_sample")
+    reasons = []
+    if self_collision.get("detected") is True:
+        reasons.append("self_collision")
+    if non_target.get("detected") is True:
+        reasons.append("non_target_world_collision")
+
+    if stage_name == "pregrasp":
+        target_contact_allowed = not target_detected
+        if target_detected:
+            reasons.append("target_contact_before_grasp_approach")
+        policy = "target_contact_forbidden"
+    elif stage_name == "preclose":
+        if contact_phase_start_sample is None:
+            raise ValueError("Preclose provenance must declare its grasp-contact phase start sample.")
+        target_contact_allowed = not target_detected or (
+            isinstance(target_first, int) and target_first >= contact_phase_start_sample
+        )
+        if not target_contact_allowed:
+            reasons.append("target_contact_before_preclose_contact_phase")
+        policy = "target_contact_allowed_only_in_final_approach_segment"
+    elif stage_name in ("lift_1", "lift_2"):
+        target_contact_allowed = True
+        policy = "retained_target_contact_allowed"
+    else:
+        raise ValueError(f"Unknown corridor stage {stage_name!r}.")
+
+    return {
+        "policy": policy,
+        "exact_task_binding": RADIO_TASK_BINDING,
+        "contact_phase_start_sample": contact_phase_start_sample,
+        "target_contact_detected": target_detected,
+        "target_contact_allowed": target_contact_allowed,
+        "blocking_reasons": reasons,
+        "collision_safe_for_stage": not reasons,
+    }
 
 
 class RadioSemanticGeometryBackend:
@@ -397,6 +473,59 @@ class RadioSemanticGeometryBackend:
                 sphere_to_link[int(sphere_index)] = link_name
         return sphere_to_link
 
+    def _radio_collision_mesh_identity(self, world_checker: object) -> dict[str, object]:
+        scope = getattr(getattr(self.env, "task", None), "object_scope", None)
+        if not isinstance(scope, Mapping) or RADIO_TASK_BINDING not in scope:
+            raise KeyError(f"Required BDDL Radio binding is absent: {RADIO_TASK_BINDING}")
+        resolved = scope[RADIO_TASK_BINDING]
+        if getattr(resolved, "exists", True) is not True:
+            raise RuntimeError(f"Required BDDL Radio object does not exist: {RADIO_TASK_BINDING}")
+        radio = getattr(resolved, "unwrapped", resolved)
+        mesh_names = sorted(
+            str(collision_mesh.prim_path)
+            for link in radio.links.values()
+            for collision_mesh in link.collision_meshes.values()
+        )
+        if not mesh_names:
+            raise RuntimeError("Task-bound Radio has no collision meshes.")
+        available = set(world_checker.get_obstacle_names())
+        missing = [name for name in mesh_names if name not in available]
+        if missing:
+            raise RuntimeError(f"Task-bound Radio collision meshes are absent from CuRobo world: {missing}")
+        return {
+            "resolution": "exact_task_object_scope_binding",
+            "task_binding": RADIO_TASK_BINDING,
+            "name": str(getattr(radio, "name", "")),
+            "category": str(getattr(radio, "category", "")),
+            "prim_path": str(getattr(radio, "prim_path", "")),
+            "collision_mesh_names": mesh_names,
+        }
+
+    def _per_sphere_world_collision(
+        self,
+        robot_spheres: th.Tensor,
+        *,
+        world_cost: object,
+    ) -> th.Tensor:
+        from curobo.geom.sdf.world import CollisionQueryBuffer
+
+        query_buffer = CollisionQueryBuffer()
+        query_buffer.update_buffer_shape(
+            robot_spheres.shape,
+            self.motion_generator.tensor_args,
+            world_cost.world_coll_checker.collision_types,
+        )
+        with th.no_grad():
+            values = world_cost.world_coll_checker.get_sphere_distance(
+                robot_spheres,
+                query_buffer,
+                world_cost.weight,
+                world_cost.activation_distance,
+                return_loss=world_cost.return_loss,
+                sum_collisions=True,
+            )
+        return values.unsqueeze(-1) if values.ndim == 2 else values
+
     def _collision_channels(
         self,
         trajectory: th.Tensor,
@@ -424,39 +553,62 @@ class RadioSemanticGeometryBackend:
             self_constraint = rollout.robot_self_collision_constraint.forward(robot_spheres).squeeze(1)
 
         world_cost = rollout.primitive_collision_constraint
-        from curobo.geom.sdf.world import CollisionQueryBuffer
-
-        query_buffer = CollisionQueryBuffer()
-        query_buffer.update_buffer_shape(
-            robot_spheres.shape,
-            self.motion_generator.tensor_args,
-            world_cost.world_coll_checker.collision_types,
-        )
-        with th.no_grad():
-            per_sphere_world = world_cost.world_coll_checker.get_sphere_distance(
-                robot_spheres,
-                query_buffer,
-                world_cost.weight,
-                world_cost.activation_distance,
-                return_loss=world_cost.return_loss,
-                sum_collisions=True,
-            )
-        if per_sphere_world.ndim == 2:
-            per_sphere_world = per_sphere_world.unsqueeze(-1)
+        world_checker = world_cost.world_coll_checker
+        per_sphere_world = self._per_sphere_world_collision(robot_spheres, world_cost=world_cost)
         sphere_to_link = self._sphere_link_names(emb_sel=emb_sel)
-        max_sphere = int(th.argmax(per_sphere_world).item() % per_sphere_world.shape[-1])
-        max_sphere_values = per_sphere_world[..., max_sphere]
+        reconstructed_world, world_summary = _summarize_per_sphere_collision(
+            per_sphere_world,
+            sphere_to_link=sphere_to_link,
+        )
+        radio_identity = self._radio_collision_mesh_identity(world_checker)
+        disabled_meshes = []
+        try:
+            for mesh_name in radio_identity["collision_mesh_names"]:
+                world_checker.enable_obstacle(mesh_name, enable=False)
+                disabled_meshes.append(mesh_name)
+            per_sphere_non_target = self._per_sphere_world_collision(robot_spheres, world_cost=world_cost)
+        finally:
+            for mesh_name in disabled_meshes:
+                world_checker.enable_obstacle(mesh_name, enable=True)
+        non_target_world, non_target_summary = _summarize_per_sphere_collision(
+            per_sphere_non_target,
+            sphere_to_link=sphere_to_link,
+        )
+        per_sphere_target = th.clamp(per_sphere_world - per_sphere_non_target, min=0.0)
+        target_world, target_summary = _summarize_per_sphere_collision(
+            per_sphere_target,
+            sphere_to_link=sphere_to_link,
+        )
+        raw_world = world_constraint.detach().reshape(-1)
+        if raw_world.shape != reconstructed_world.shape:
+            raise RuntimeError(
+                "CuRobo world collision summary shape differs from the per-sphere diagnostic decomposition."
+            )
+        decomposition_residual = float(th.max(th.abs(raw_world - reconstructed_world)).cpu())
+        world_summary["decomposition_max_abs_residual"] = decomposition_residual
+        non_target_summary["constraint_score"] = non_target_world.detach().cpu().tolist()
+        target_summary.update(
+            {
+                "constraint_score": target_world.detach().cpu().tolist(),
+                "identity": radio_identity,
+                "attribution_method": "disable_exact_task_bound_collision_meshes_and_requery",
+            }
+        )
+        if world_summary["detected"] and target_summary["detected"] and not non_target_summary["detected"]:
+            attribution = "target_object_only"
+        elif world_summary["detected"] and target_summary["detected"] and non_target_summary["detected"]:
+            attribution = "target_and_non_target"
+        elif world_summary["detected"]:
+            attribution = "non_target_only"
+        else:
+            attribution = "none"
+        world_summary["attribution"] = attribution
         return {
             "world_constraint_score": world_constraint.detach().cpu().tolist(),
             "self_constraint_score": self_constraint.detach().cpu().tolist(),
-            "world_collision": {
-                "detected": bool(th.any(world_constraint > 0.0).item()),
-                "first_collision_sample": _first_positive_sample(world_constraint),
-                "maximum_constraint_score": _max_positive_value(world_constraint),
-                "worst_sphere_index": max_sphere,
-                "worst_sphere_link": sphere_to_link.get(max_sphere),
-                "worst_sphere_maximum_score": _max_positive_value(max_sphere_values),
-            },
+            "world_collision": world_summary,
+            "non_target_world_collision": non_target_summary,
+            "target_object_collision": target_summary,
             "self_collision": {
                 "detected": bool(th.any(self_constraint > 0.0).item()),
                 "first_collision_sample": _first_positive_sample(self_constraint),
@@ -548,6 +700,15 @@ class RadioSemanticGeometryBackend:
             if float(th.max(th.abs(current[gripper_indices] - open_target))) > 0.002:
                 raise RuntimeError("G013 provenance requires an initially open right gripper.")
         trajectory_parts = []
+        close_steps = None
+        if stage_name == "lift_1":
+            close_steps = int(branch["gripper_close_interpolation_steps"])
+            close_goal = current.detach().clone()
+            close_goal[gripper_indices] = th.as_tensor(
+                branch["closed_gripper_joint_positions_m"], device=current.device, dtype=current.dtype
+            )
+            trajectory_parts.append(self._fixed_step_interpolation(current, close_goal, close_steps))
+            current = close_goal
         for waypoint, step_count in zip(waypoints, steps, strict=True):
             goal = current.detach().clone()
             goal[arm_indices] = th.as_tensor(waypoint, device=current.device, dtype=current.dtype)
@@ -556,6 +717,9 @@ class RadioSemanticGeometryBackend:
             trajectory_parts.append(segment if not trajectory_parts else segment[1:])
             current = goal
         trajectory = th.cat(trajectory_parts, dim=0)
+        contact_phase_start_sample = None
+        if stage_name == "preclose":
+            contact_phase_start_sample = sum(int(step) for step in steps[:-1]) + 1
         return (
             current,
             trajectory,
@@ -564,6 +728,8 @@ class RadioSemanticGeometryBackend:
                 "stage": stage_name,
                 "waypoint_count": len(waypoints),
                 "interpolation_steps": [int(step) for step in steps],
+                "gripper_close_interpolation_steps": close_steps,
+                "contact_phase_start_sample": contact_phase_start_sample,
                 "locked_segments": ["base", "trunk", "arm_left", "gripper_left"],
             },
         )
@@ -713,6 +879,12 @@ class RadioSemanticGeometryBackend:
             collision = th.as_tensor(collision_channels["world_constraint_score"]) > 0.0
             collision = collision | (th.as_tensor(collision_channels["self_constraint_score"]) > 0.0)
             collision_free = not bool(th.any(collision).item())
+            collision_policy = _stage_collision_policy(
+                stage_name,
+                collision_channels,
+                contact_phase_start_sample=provenance["contact_phase_start_sample"],
+            )
+            collision_safe = collision_policy["collision_safe_for_stage"] is True
             clearance = self._table_clearance(trajectory)
             stages[stage_name] = {
                 "ik": {
@@ -726,6 +898,8 @@ class RadioSemanticGeometryBackend:
                 "collision": {
                     "status": "available",
                     "collision_free": collision_free,
+                    "collision_safe_for_stage": collision_safe,
+                    "target_contact_policy": collision_policy,
                     "sample_count": int(trajectory.shape[0]),
                     "first_collision_sample": _first_positive_sample(collision_channels["world_constraint_score"]),
                     "model": "g013_segmented_joint_path_checked_at_each_sample",
@@ -736,7 +910,7 @@ class RadioSemanticGeometryBackend:
                 "clearance": clearance,
                 "provenance": {**provenance, "branch_id": branch["branch_id"]},
             }
-            if not collision_free:
+            if not collision_safe:
                 break
             start_q = goal_q
         for stage_name in CORRIDOR_STAGE_NAMES:

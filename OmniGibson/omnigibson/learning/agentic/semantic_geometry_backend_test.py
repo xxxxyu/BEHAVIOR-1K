@@ -12,8 +12,10 @@ from omnigibson.learning.agentic.semantic_geometry_backend import _resolve_curob
 from omnigibson.learning.agentic.semantic_geometry_backend import _first_positive_sample
 from omnigibson.learning.agentic.semantic_geometry_backend import _max_positive_value
 from omnigibson.learning.agentic.semantic_geometry_backend import _pose_residual
+from omnigibson.learning.agentic.semantic_geometry_backend import _stage_collision_policy
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_clearance
 from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_ik_solution
+from omnigibson.learning.agentic.semantic_geometry_backend import _summarize_per_sphere_collision
 from omnigibson.macros import gm
 
 
@@ -64,6 +66,60 @@ def test_collision_channel_summary_accepts_serialized_scores():
 
     assert _first_positive_sample(values) == 2
     assert _max_positive_value(values) == pytest.approx(0.03)
+
+
+def test_per_sphere_collision_summary_preserves_sample_and_link_attribution():
+    sample_scores, summary = _summarize_per_sphere_collision(
+        th.tensor([[[0.0, 0.0]], [[0.2, 0.5]], [[0.0, 0.1]]]),
+        sphere_to_link={0: "arm", 1: "finger"},
+    )
+
+    th.testing.assert_close(sample_scores, th.tensor([0.0, 0.7, 0.1]))
+    assert summary == {
+        "detected": True,
+        "first_collision_sample": 1,
+        "maximum_constraint_score": pytest.approx(0.7),
+        "worst_sphere_index": 1,
+        "worst_sphere_link": "finger",
+        "worst_sphere_maximum_score": pytest.approx(0.5),
+    }
+
+
+def test_stage_collision_policy_allows_only_late_exact_target_contact():
+    channels = {
+        "target_object_collision": {"detected": True, "first_collision_sample": 27},
+        "non_target_world_collision": {"detected": False},
+        "self_collision": {"detected": False},
+    }
+
+    preclose = _stage_collision_policy("preclose", channels, contact_phase_start_sample=19)
+    assert preclose["collision_safe_for_stage"] is True
+    assert preclose["target_contact_allowed"] is True
+
+    early = {
+        **channels,
+        "target_object_collision": {"detected": True, "first_collision_sample": 18},
+    }
+    rejected = _stage_collision_policy("preclose", early, contact_phase_start_sample=19)
+    assert rejected["collision_safe_for_stage"] is False
+    assert rejected["blocking_reasons"] == ["target_contact_before_preclose_contact_phase"]
+
+    pregrasp = _stage_collision_policy("pregrasp", channels, contact_phase_start_sample=None)
+    assert pregrasp["collision_safe_for_stage"] is False
+
+
+def test_stage_collision_policy_never_suppresses_non_target_or_self_collision():
+    channels = {
+        "target_object_collision": {"detected": True, "first_collision_sample": 27},
+        "non_target_world_collision": {"detected": True},
+        "self_collision": {"detected": True},
+    }
+
+    result = _stage_collision_policy("lift_1", channels, contact_phase_start_sample=None)
+
+    assert result["target_contact_allowed"] is True
+    assert result["collision_safe_for_stage"] is False
+    assert result["blocking_reasons"] == ["self_collision", "non_target_world_collision"]
 
 
 def test_pose_residual_aligns_target_dtype_with_fk_output():
@@ -296,6 +352,7 @@ def test_g013_provenance_trajectory_changes_only_right_arm_and_gripper_indices()
     branch = {
         "open_gripper_joint_positions_m": [0.05, 0.05],
         "closed_gripper_joint_positions_m": [0.021, 0.016],
+        "gripper_close_interpolation_steps": 4,
         "stages": {
             "preclose": {
                 "right_arm_waypoints_rad": [[0.1] * 7, [0.2] * 7],
@@ -319,6 +376,38 @@ def test_g013_provenance_trajectory_changes_only_right_arm_and_gripper_indices()
     th.testing.assert_close(goal[arm_indices], th.full((7,), 0.2))
     th.testing.assert_close(goal[gripper_indices], th.tensor([0.05, 0.05]))
     assert provenance["interpolation_steps"] == [2, 3]
+
+
+def test_g013_lift_trajectory_closes_before_moving_the_arm():
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    start = th.zeros(10, dtype=th.float32)
+    arm_indices = th.arange(7)
+    gripper_indices = th.tensor([8, 9])
+    start[gripper_indices] = 0.05
+    branch = {
+        "open_gripper_joint_positions_m": [0.05, 0.05],
+        "closed_gripper_joint_positions_m": [0.021, 0.016],
+        "gripper_close_interpolation_steps": 4,
+        "stages": {
+            "lift_1": {
+                "right_arm_waypoints_rad": [[0.2] * 7],
+                "interpolation_steps": [3],
+            }
+        },
+    }
+
+    goal, trajectory, provenance = backend._provenance_trajectory(
+        start,
+        branch=branch,
+        stage_name="lift_1",
+        arm_indices=arm_indices,
+        gripper_indices=gripper_indices,
+    )
+
+    assert trajectory.shape == (8, 10)
+    th.testing.assert_close(trajectory[:5, arm_indices], th.zeros((5, 7)))
+    th.testing.assert_close(trajectory[4:, gripper_indices], goal[gripper_indices].expand(4, -1))
+    assert provenance["gripper_close_interpolation_steps"] == 4
 
 
 def test_ik_goal_uses_existing_full_joint_state_without_reaugmenting_locked_joints():
