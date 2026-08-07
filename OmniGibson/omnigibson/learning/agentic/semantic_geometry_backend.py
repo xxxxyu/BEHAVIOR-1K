@@ -141,14 +141,14 @@ def _summarize_ik_solution(goal_q: th.Tensor) -> dict[str, object]:
     }
 
 
-def _first_positive_sample(values: th.Tensor) -> int | None:
-    positive = values.detach().reshape(-1) > 0.0
+def _first_positive_sample(values: object) -> int | None:
+    positive = th.as_tensor(values).detach().reshape(-1) > 0.0
     indices = th.nonzero(positive, as_tuple=False).reshape(-1)
     return int(indices[0].item()) if indices.numel() else None
 
 
-def _max_positive_value(values: th.Tensor) -> float | None:
-    values = values.detach().reshape(-1)
+def _max_positive_value(values: object) -> float | None:
+    values = th.as_tensor(values).detach().reshape(-1)
     positive = values[values > 0.0]
     return float(th.max(positive).cpu()) if positive.numel() else None
 

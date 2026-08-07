@@ -59,6 +59,13 @@ def test_collision_channel_summary_preserves_first_sample_and_positive_maximum()
     assert _max_positive_value(th.tensor([-1.0, 0.0])) is None
 
 
+def test_collision_channel_summary_accepts_serialized_scores():
+    values = [[-0.2], [0.0], [0.03], [0.01]]
+
+    assert _first_positive_sample(values) == 2
+    assert _max_positive_value(values) == pytest.approx(0.03)
+
+
 def test_pose_residual_aligns_target_dtype_with_fk_output():
     result = _pose_residual(
         th.tensor([1.0, 2.0, 3.0], dtype=th.float64),
