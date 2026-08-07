@@ -145,6 +145,58 @@ def test_candidate_joint_state_is_copied_to_curobo_device_before_ik():
     th.testing.assert_close(backend.robot.get_joint_positions(), th.zeros(8))
 
 
+def test_candidate_current_base_pose_reproduces_current_virtual_base_joints():
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.robot = _Robot()
+    backend.robot.q[:6] = th.tensor([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+
+    result = backend._candidate_joint_state(_pose([11.0, 22.0, 0.0]))
+
+    th.testing.assert_close(result, backend.robot.get_joint_positions())
+
+
+def test_ordered_joint_state_updates_embodiment_locks_before_fk_ordering():
+    class _FullState:
+        def __init__(self, label):
+            self.label = label
+            self.order_calls = []
+
+        def get_ordered_joint_state(self, names):
+            self.order_calls.append(list(names))
+            return (self.label, tuple(names))
+
+    class _MotionGenerator:
+        def __init__(self):
+            self.mg = {
+                "arm": type(
+                    "_ArmMotionGenerator",
+                    (),
+                    {"kinematics": type("_Kinematics", (), {"joint_names": ["right_arm_joint1"]})()},
+                )()
+            }
+            self.lock_updates = []
+
+        def update_locked_joints(self, joint_state, emb_sel):
+            self.lock_updates.append((joint_state, emb_sel))
+
+    backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
+    backend.motion_generator = _MotionGenerator()
+    trajectory_state = _FullState("trajectory")
+    locked_state = _FullState("fixture")
+    states = iter((trajectory_state, locked_state))
+    backend._full_joint_state_for_curobo = lambda _: next(states)
+
+    result = backend._ordered_joint_state_for_curobo(
+        th.zeros((2, 3)),
+        emb_sel="arm",
+        locked_joint_positions=th.zeros(3),
+    )
+
+    assert backend.motion_generator.lock_updates == [(locked_state, "arm")]
+    assert trajectory_state.order_calls == [["right_arm_joint1"]]
+    assert result == ("trajectory", ("right_arm_joint1",))
+
+
 def test_world_target_is_expressed_in_curobo_base_frame_before_fk_comparison():
     backend = RadioSemanticGeometryBackend.__new__(RadioSemanticGeometryBackend)
     backend.robot = _Robot()

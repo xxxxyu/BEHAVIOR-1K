@@ -227,6 +227,36 @@ class RadioSemanticGeometryBackend:
         candidate = self.motion_generator.tensor_args.to_device(self._candidate_joint_state(candidate_base_pose))
         return _quantize_tensor(candidate)
 
+    def _full_joint_state_for_curobo(self, joint_positions: th.Tensor):
+        positions = joint_positions.unsqueeze(0) if joint_positions.ndim == 1 else joint_positions
+        if positions.ndim != 2:
+            raise ValueError("CuRobo joint positions must be a vector or a batch of vectors.")
+        return lazy.curobo.types.state.JointState(
+            position=self.motion_generator.tensor_args.to_device(positions),
+            joint_names=self.motion_generator.robot_joint_names,
+        )
+
+    def _ordered_joint_state_for_curobo(
+        self,
+        joint_positions: th.Tensor,
+        *,
+        emb_sel: CuRoboEmbodimentSelection,
+        locked_joint_positions: th.Tensor | None = None,
+    ):
+        """Update embodiment locks before ordering active joints for FK.
+
+        CuRobo omits locked joints from ``kinematics.joint_names`` and stores
+        their values in mutable fixed transforms. Direct FK therefore must
+        update those transforms just like ``compute_trajectories`` does.
+        """
+
+        full_state = self._full_joint_state_for_curobo(joint_positions)
+        locked_state = (
+            full_state if locked_joint_positions is None else self._full_joint_state_for_curobo(locked_joint_positions)
+        )
+        self.motion_generator.update_locked_joints(locked_state, emb_sel)
+        return full_state.get_ordered_joint_state(self.motion_generator.mg[emb_sel].kinematics.joint_names)
+
     def _reset_ik_seed_generator(self) -> None:
         """Make a read-only corridor query independent of prior diagnostic queries."""
 
@@ -381,15 +411,11 @@ class RadioSemanticGeometryBackend:
         """
 
         emb_sel = CuRoboEmbodimentSelection.DEFAULT
-        initial_state = lazy.curobo.types.state.JointState(
-            position=self.motion_generator.tensor_args.to_device(initial_joint_pos.unsqueeze(0)),
-            joint_names=self.motion_generator.robot_joint_names,
+        joint_state = self._ordered_joint_state_for_curobo(
+            trajectory,
+            emb_sel=emb_sel,
+            locked_joint_positions=initial_joint_pos,
         )
-        self.motion_generator.update_locked_joints(initial_state, emb_sel)
-        joint_state = lazy.curobo.types.state.JointState(
-            position=self.motion_generator.tensor_args.to_device(trajectory),
-            joint_names=self.motion_generator.robot_joint_names,
-        ).get_ordered_joint_state(self.motion_generator.mg[emb_sel].kinematics.joint_names)
         robot_spheres = self.motion_generator.mg[emb_sel].compute_kinematics(joint_state).robot_spheres
         robot_spheres = robot_spheres.unsqueeze(1)
         rollout = self.motion_generator.mg[emb_sel].rollout_fn
@@ -442,10 +468,10 @@ class RadioSemanticGeometryBackend:
     def _table_clearance(self, trajectory: th.Tensor) -> dict[str, object]:
         self._ensure_table_checker()
         arm_mg = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM]
-        cu_joint_state = lazy.curobo.types.state.JointState(
-            position=self.motion_generator.tensor_args.to_device(trajectory),
-            joint_names=self.motion_generator.robot_joint_names,
-        ).get_ordered_joint_state(arm_mg.kinematics.joint_names)
+        cu_joint_state = self._ordered_joint_state_for_curobo(
+            trajectory,
+            emb_sel=CuRoboEmbodimentSelection.ARM,
+        )
         spheres = arm_mg.compute_kinematics(cu_joint_state).robot_spheres
         indices = self._right_arm_sphere_indices()
         spheres = spheres[:, indices, :].unsqueeze(0)
@@ -542,23 +568,91 @@ class RadioSemanticGeometryBackend:
             },
         )
 
-    def _right_eef_target_residual(
+    def _right_eef_pose_for_joint_positions(self, joint_positions: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        arm_mg = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM]
+        joint_state = self._ordered_joint_state_for_curobo(
+            joint_positions,
+            emb_sel=CuRoboEmbodimentSelection.ARM,
+        )
+        link_pose = arm_mg.compute_kinematics(joint_state).link_poses[self.robot.eef_link_names["right"]]
+        return (
+            link_pose.position.reshape(-1, 3)[-1],
+            link_pose.quaternion.reshape(-1, 4)[-1][[1, 2, 3, 0]],
+        )
+
+    def _right_eef_target_comparison(
         self,
         joint_positions: th.Tensor,
         *,
         target_pose: Mapping[str, object],
         stage_name: str,
-    ) -> dict[str, float]:
+    ) -> dict[str, object]:
         target_position, target_orientation = self._target_pose_for_curobo(target_pose, stage_name)
+        actual_position, actual_orientation = self._right_eef_pose_for_joint_positions(joint_positions)
+        base_link_name = self.motion_generator.base_link[CuRoboEmbodimentSelection.ARM]
+        return {
+            "kinematic_base_link": base_link_name,
+            "actual_pose_in_kinematic_base": {
+                "translation_m": actual_position.detach().cpu().tolist(),
+                "quaternion_xyzw": actual_orientation.detach().cpu().tolist(),
+            },
+            "target_pose_in_kinematic_base": {
+                "translation_m": target_position.detach().cpu().tolist(),
+                "quaternion_xyzw": target_orientation.detach().cpu().tolist(),
+            },
+            "residual": _pose_residual(actual_position, actual_orientation, target_position, target_orientation),
+        }
+
+    def _candidate_joint_state_diagnostic(self, joint_positions: th.Tensor) -> dict[str, object]:
+        names = self.motion_generator.robot_joint_names
+        if len(names) != int(joint_positions.numel()):
+            raise RuntimeError("Candidate joint vector does not match the simulator joint-name ordering.")
         arm_mg = self.motion_generator.mg[CuRoboEmbodimentSelection.ARM]
-        joint_state = lazy.curobo.types.state.JointState(
-            position=self.motion_generator.tensor_args.to_device(joint_positions.unsqueeze(0)),
-            joint_names=self.motion_generator.robot_joint_names,
-        ).get_ordered_joint_state(arm_mg.kinematics.joint_names)
-        link_pose = arm_mg.compute_kinematics(joint_state).link_poses[self.robot.eef_link_names["right"]]
-        actual_position = link_pose.position.reshape(-1, 3)[-1]
-        actual_orientation = link_pose.quaternion.reshape(-1, 4)[-1][[1, 2, 3, 0]]
-        return _pose_residual(actual_position, actual_orientation, target_position, target_orientation)
+        full_state = self._full_joint_state_for_curobo(joint_positions)
+        self.motion_generator.update_locked_joints(full_state, CuRoboEmbodimentSelection.ARM)
+        locked_state = arm_mg.kinematics.kinematics_config.lock_jointstate
+
+        actual_position, actual_orientation = self._right_eef_pose_for_joint_positions(joint_positions)
+        base_link_name = self.motion_generator.base_link[CuRoboEmbodimentSelection.ARM]
+        base_position, base_orientation = self.robot.links[base_link_name].get_position_orientation()
+        simulator_position, simulator_orientation = self.robot.eef_links["right"].get_position_orientation()
+        simulator_position, simulator_orientation = T.pose_transform(
+            *T.invert_pose_transform(base_position, base_orientation),
+            simulator_position,
+            simulator_orientation,
+        )
+        return {
+            "joint_positions_by_name": dict(zip(names, joint_positions.detach().cpu().tolist(), strict=True)),
+            "curobo_active_joint_names": list(arm_mg.kinematics.joint_names),
+            "curobo_locked_joint_positions_by_name": dict(
+                zip(
+                    locked_state.joint_names,
+                    locked_state.position.detach().cpu().tolist(),
+                    strict=True,
+                )
+            ),
+            "kinematic_base_link": base_link_name,
+            "kinematic_base_pose_world": {
+                "translation_m": base_position.detach().cpu().tolist(),
+                "quaternion_xyzw": base_orientation.detach().cpu().tolist(),
+            },
+            "right_eef_pose_in_kinematic_base": {
+                "curobo_fk": {
+                    "translation_m": actual_position.detach().cpu().tolist(),
+                    "quaternion_xyzw": actual_orientation.detach().cpu().tolist(),
+                },
+                "simulator": {
+                    "translation_m": simulator_position.detach().cpu().tolist(),
+                    "quaternion_xyzw": simulator_orientation.detach().cpu().tolist(),
+                },
+                "residual": _pose_residual(
+                    actual_position,
+                    actual_orientation,
+                    simulator_position,
+                    simulator_orientation,
+                ),
+            },
+        }
 
     def _provenance_branch(
         self,
@@ -569,6 +663,7 @@ class RadioSemanticGeometryBackend:
     ) -> dict[str, object]:
         arm_indices, gripper_indices = self._provenance_indices()
         start_q = self._candidate_joint_state_for_curobo(candidate_base_pose)
+        candidate_joint_state_diagnostic = self._candidate_joint_state_diagnostic(start_q)
         self.motion_generator.update_obstacles()
         stages: dict[str, object] = {}
         for stage_name in CORRIDOR_STAGE_NAMES:
@@ -588,11 +683,12 @@ class RadioSemanticGeometryBackend:
                     "provenance": {"source": "g013_frozen_right_arm_joint_path", "branch_id": branch["branch_id"]},
                 }
                 break
-            target_residual = self._right_eef_target_residual(
+            target_comparison = self._right_eef_target_comparison(
                 goal_q,
                 target_pose=target_poses[stage_name],
                 stage_name=stage_name,
             )
+            target_residual = target_comparison["residual"]
             target_matches = (
                 target_residual["translation_m"] <= PROVENANCE_TARGET_TRANSLATION_TOLERANCE_M
                 and target_residual["orientation_rad"] <= PROVENANCE_TARGET_ORIENTATION_TOLERANCE_RAD
@@ -604,6 +700,7 @@ class RadioSemanticGeometryBackend:
                         "feasible": False,
                         "reason": "provenance_endpoint_misses_semantic_target",
                         "target_residual": target_residual,
+                        "kinematic_comparison": target_comparison,
                     },
                     "collision": {"status": "not_evaluated", "collision_free": False, "reason": "ik_failed"},
                     "clearance": {"status": "not_evaluated", "reason": "ik_failed"},
@@ -624,6 +721,7 @@ class RadioSemanticGeometryBackend:
                     "solver": "g013_frozen_right_arm_joint_path",
                     "solution_joint_positions_rad": goal_q.detach().cpu().tolist(),
                     "target_residual": target_residual,
+                    "kinematic_comparison": target_comparison,
                 },
                 "collision": {
                     "status": "available",
@@ -654,6 +752,7 @@ class RadioSemanticGeometryBackend:
         return {
             "branch_id": branch["branch_id"],
             "source_run": branch["source_run"],
+            "candidate_joint_state_diagnostic": candidate_joint_state_diagnostic,
             "joint_provenance": {
                 "source": "g013_frozen_right_arm_joint_path",
                 "source_generation": "013",
